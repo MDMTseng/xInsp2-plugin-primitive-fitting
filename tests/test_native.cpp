@@ -15,10 +15,12 @@
 #include <windows.h>
 #endif
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <random>
 #include <string>
 
 #ifndef PRIMITIVE_FITTING_DLL_PATH
@@ -51,6 +53,59 @@ static xi_image_handle make_horizontal_edge(int w, int h, int edge_y) {
     for (int y = 0; y < h; ++y) {
         std::memset(d + (size_t)y * stride,
                     (uint8_t)(y < edge_y ? 40 : 210), (size_t)w);
+    }
+    return img;
+}
+
+// Same step edge, plus per-pixel additive Gaussian noise of stddev `sigma`
+// (clamped to [0,255]) and optional `n_stripes` bright rectangular
+// distractors randomly placed within ±30 px of `edge_y` — mimicking the
+// "spike / false-stripe" structural noise the production fitter is
+// designed to reject. Fixed seed so the test is deterministic.
+static xi_image_handle make_horizontal_edge_noisy(int w, int h, int edge_y,
+                                                  double sigma,
+                                                  int n_stripes = 0,
+                                                  uint32_t seed = 0xC0FFEE) {
+    xi_image_handle img = g_host.image_create(w, h, 1);
+    uint8_t* d = g_host.image_data(img);
+    int32_t  stride = g_host.image_stride(img);
+    // Base: step edge.
+    for (int y = 0; y < h; ++y) {
+        std::memset(d + (size_t)y * stride,
+                    (uint8_t)(y < edge_y ? 40 : 210), (size_t)w);
+    }
+    std::mt19937 rng(seed);
+    // False stripes: bright 1–3 px tall bars within ±30 of edge, mirroring
+    // lab/scene.cpp's draw_stripes()-style spike noise.
+    if (n_stripes > 0) {
+        const int y_lo = std::max(1, edge_y - 30);
+        const int y_hi = std::min(h - 2, edge_y + 30);
+        const int min_len = std::max(4, w / 20);
+        const int max_len = std::max(min_len + 1, w / 4);
+        std::uniform_int_distribution<int> dlen(min_len, max_len);
+        std::uniform_int_distribution<int> dht(1, 3);
+        std::uniform_int_distribution<int> dy(y_lo, y_hi);
+        for (int i = 0; i < n_stripes; ++i) {
+            int len = dlen(rng);
+            int ht  = dht(rng);
+            int x0  = std::uniform_int_distribution<int>(0, std::max(0, w - len))(rng);
+            int y0  = dy(rng);
+            for (int yy = y0; yy < y0 + ht && yy < h; ++yy) {
+                uint8_t* row = d + (size_t)yy * stride;
+                for (int xx = x0; xx < x0 + len && xx < w; ++xx) row[xx] = 245;
+            }
+        }
+    }
+    // Per-pixel Gaussian noise.
+    if (sigma > 0) {
+        std::normal_distribution<double> gn(0.0, sigma);
+        for (int y = 0; y < h; ++y) {
+            uint8_t* row = d + (size_t)y * stride;
+            for (int x = 0; x < w; ++x) {
+                double v = (double)row[x] + gn(rng);
+                row[x] = (uint8_t)std::clamp(v, 0.0, 255.0);
+            }
+        }
     }
     return img;
 }
@@ -789,6 +844,78 @@ XI_TEST(non_finite_config_values_are_ignored) {
     // The non-finite doubles must NOT have overwritten the previous 2.5 / 45.
     XI_EXPECT(status.find("\"ransac_threshold_px\":2.5") != std::string::npos);
     XI_EXPECT(status.find("\"poly_max_slope_deg\":45") != std::string::npos);
+    g_syms.destroy(inst);
+}
+
+// Sweep Gaussian noise σ across a horizontal step edge; confirm the new
+// confidence/stability/residual_median fields move monotonically — high
+// confidence on the clean image, degrading as noise rises. A smoke test
+// for the confidence-scoring plumbing and a diagnostic readout.
+XI_TEST(confidence_degrades_with_gaussian_noise) {
+    load_dll();
+    void* inst = g_syms.create(&g_host, "t_conf");
+    const int W = 320, H = 240, EDGE_Y = 120;
+
+    char rsp[4096];
+    g_syms.exchange(inst,
+        R"({"command":"set_region","mode":"line",)"
+        R"("p1x":30,"p1y":120,"p2x":290,"p2y":120})",
+        rsp, sizeof(rsp));
+    g_syms.exchange(inst,
+        R"({"command":"set_config",)"
+        R"("fit_model":"line","polarity":"dark_to_bright",)"
+        R"("num_calipers":20,"caliper_width":3,"caliper_span":80,)"
+        R"("min_edge_strength":8,)"
+        R"("ransac_threshold_px":1.5,"ransac_iterations":200,)"
+        R"("expected_outlier_rate":0.2,)"
+        R"("min_length_px":0,"min_inlier_ratio":0})",
+        rsp, sizeof(rsp));
+
+    struct Case { double sigma; int stripes; };
+    const Case cases[] = {
+        {0.0,   0},   // clean baseline
+        {5.0,   0},   // pixel noise only
+        {15.0,  0},
+        {5.0,  10},   // few stripes
+        {10.0, 20},   // moderate stripes
+        {15.0, 40},   // many stripes
+        {25.0, 60},   // very dense — near adversarial
+    };
+    double prev_conf = 2.0;
+    std::fprintf(stderr, "  confidence vs (σ, stripes):\n");
+    for (const auto& c : cases) {
+        xi_image_handle scene = make_horizontal_edge_noisy(W, H, EDGE_Y,
+                                                           c.sigma, c.stripes);
+        xi_record_image imgs[] = {{"src", scene}};
+        xi_record in; in.images = imgs; in.image_count = 1; in.json = "{}";
+        xi_record_out out; xi_record_out_init(&out);
+        g_syms.process(inst, &in, &out);
+        std::string result = out.json ? out.json : "";
+
+        double conf   = json_num(result, "confidence");
+        double stab   = json_num(result, "stability");
+        double resmed = json_num(result, "residual_median_px");
+        int    inl    = json_int(result, "inlier_count");
+        int    total  = json_int(result, "total_hits");
+        bool   found  = json_bool(result, "found");
+        std::fprintf(stderr,
+            "    σ=%4.1f  stripes=%2d  found=%d  inliers=%d/%d  "
+            "conf=%.3f  stab=%.3f  res_med=%.3f px\n",
+            c.sigma, c.stripes, (int)found, inl, total, conf, stab, resmed);
+
+        // Clean baseline must be near-perfect.
+        if (c.sigma == 0.0 && c.stripes == 0) {
+            XI_EXPECT(found);
+            XI_EXPECT(conf > 0.5);
+            XI_EXPECT(stab > 0.9);
+        }
+        prev_conf = conf;
+        (void)prev_conf;
+
+        release_out_images(out);
+        xi_record_out_free(&out);
+        g_host.image_release(scene);
+    }
     g_syms.destroy(inst);
 }
 
