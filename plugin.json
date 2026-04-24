@@ -1,0 +1,7 @@
+{
+  "name": "primitive_fitting",
+  "description": "Caliper-based primitive fitting — line / arc / ellipse-arc regions, RANSAC + LSQ fits, optional polynomial residual filter.",
+  "dll": "primitive_fitting.dll",
+  "factory": "xi_plugin_create",
+  "has_ui": true
+}

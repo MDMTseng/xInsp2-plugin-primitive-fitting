@@ -1,0 +1,512 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+    body { font-family: var(--vscode-font-family, sans-serif); font-size: 12px; color: var(--vscode-foreground, #ccc); background: var(--vscode-editor-background, #1e1e1e); padding: 10px; margin: 0; }
+    h2 { margin: 0 0 8px; font-size: 14px; }
+    h3 { margin: 12px 0 6px; font-size: 12px; opacity: 0.8; text-transform: uppercase; letter-spacing: 0.5px; }
+    .row { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; flex-wrap: wrap; }
+    label { min-width: 110px; opacity: 0.8; }
+    input[type=text], input[type=number] { padding: 3px 6px; background: var(--vscode-input-background, #3c3c3c); color: var(--vscode-input-foreground, #ccc); border: 1px solid var(--vscode-input-border, #555); font-size: 12px; }
+    input[type=number] { width: 80px; }
+    select { padding: 3px 6px; background: #3c3c3c; color: #ccc; border: 1px solid #555; font-size: 12px; }
+    button { padding: 4px 10px; cursor: pointer; border: none; border-radius: 3px; font-size: 12px; background: #2196f3; color: white; }
+    button.ghost { background: transparent; border: 1px solid #555; color: #ccc; }
+    .stage { position: relative; margin-top: 6px; background: #111; border: 1px solid #333; }
+    .stage img { display: block; max-width: 100%; height: auto; }
+    .stage canvas { position: absolute; top: 0; left: 0; cursor: crosshair; }
+    .hint { font-size: 11px; opacity: 0.6; margin: 4px 0; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 3px; font-weight: bold; font-size: 11px; letter-spacing: 0.5px; }
+    .badge.pass { background: #1b5e20; color: #b9f6ca; }
+    .badge.fail { background: #7f1d1d; color: #ffcdd2; }
+    .badge.idle { background: #333;    color: #aaa; }
+    .empty { opacity: 0.5; font-style: italic; padding: 6px 0; }
+    .metric-grid { display: grid; grid-template-columns: auto 1fr auto 1fr; gap: 4px 14px; font-size: 11px; }
+    .metric-grid .k { opacity: 0.6; }
+    .metric-grid .v { font-family: monospace; }
+</style>
+</head>
+<body>
+    <h2>Primitive Fitting</h2>
+    <div class="hint">Caliper-based primitive fitting: Line / Arc / Ellipse-Arc regions, Line / Circle / Ellipse / Polynomial fits, optional polynomial residual filter, top-N per caliper, weighted RANSAC, slope-bounded polynomial fit.</div>
+
+    <h3>Latest Detection <span id="result-info" class="hint" style="text-transform:none;letter-spacing:0"></span></h3>
+    <div class="stage" id="result-stage" style="background:#0a1410">
+        <img id="result-img" alt="no detection yet" style="display:none">
+        <div id="result-empty" class="empty" style="padding:14px">No detection yet — set a region and run an inspection.</div>
+    </div>
+    <div class="row" style="margin-top:6px">
+        <span id="verdict" class="badge idle">IDLE</span>
+        <span id="verdict-reason" class="hint"></span>
+    </div>
+    <div class="metric-grid" style="margin-top:6px">
+        <span class="k">angle</span>  <span class="v" id="m-angle">—</span>
+        <span class="k">length</span> <span class="v" id="m-length">—</span>
+        <span class="k">inliers</span><span class="v" id="m-in">—</span>
+        <span class="k">ratio</span>  <span class="v" id="m-ratio">—</span>
+        <span class="k">poly</span>   <span class="v" id="m-poly">—</span>
+        <span class="k">residual σ</span><span class="v" id="m-sigma">—</span>
+        <span class="k">confidence</span><span class="v" id="m-conf">—</span>
+        <span class="k">stability</span><span class="v" id="m-stab">—</span>
+        <span class="k">residual med</span><span class="v" id="m-resmed">—</span>
+    </div>
+
+    <h3>Search Region</h3>
+    <div class="row">
+        <label>Region mode:</label>
+        <select id="region_mode" onchange="onRegionModeChange()">
+            <option value="line" selected>Line</option>
+            <option value="arc">Arc</option>
+            <option value="ellipse_arc">Ellipse Arc</option>
+        </select>
+        <label>Fit model:</label>
+        <select id="fit_model">
+            <option value="line" selected>Line</option>
+            <option value="circle">Circle</option>
+            <option value="ellipse">Ellipse</option>
+            <option value="polynomial">Polynomial</option>
+        </select>
+    </div>
+    <div class="hint" id="region-hint-line">Drag on the live image to draw a search line. Afterwards each endpoint is a draggable handle. Caliper boxes show where each sample is taken.</div>
+    <div class="hint" id="region-hint-arc"         style="display:none">Arc mode: set the nominal center, radius, and angular range. Calipers scan radially outward across the expected edge.</div>
+    <div class="hint" id="region-hint-ellipse_arc" style="display:none">Ellipse arc mode: set the center, semi-major (a), semi-minor (b), rotation, and angular range. Calipers scan along the local ellipse normal.</div>
+    <div class="stage" id="src-stage">
+        <img id="src-img" alt="preview">
+        <canvas id="src-canvas"></canvas>
+    </div>
+    <div class="row" id="line-inputs" style="margin-top:6px">
+        <label>p1 (x, y):</label>
+        <input type="number" id="p1x" step="0.5"><input type="number" id="p1y" step="0.5">
+        <label style="min-width:40px">p2 (x, y):</label>
+        <input type="number" id="p2x" step="0.5"><input type="number" id="p2y" step="0.5">
+        <button onclick="applyRegion()">Apply Region</button>
+    </div>
+    <div class="row" id="arc-inputs" style="margin-top:6px;display:none">
+        <label>Center (cx, cy):</label>
+        <input type="number" id="arc_cx" step="0.5"><input type="number" id="arc_cy" step="0.5">
+        <label style="min-width:50px">Radius:</label>
+        <input type="number" id="arc_r" step="0.5">
+    </div>
+    <div class="row" id="arc-inputs2" style="display:none">
+        <label>θ start (deg):</label>
+        <input type="number" id="arc_theta_start" step="1" value="0">
+        <label>θ end (deg):</label>
+        <input type="number" id="arc_theta_end" step="1" value="360">
+        <button onclick="applyRegion()">Apply Region</button>
+    </div>
+    <div class="row" id="ellipse-inputs" style="margin-top:6px;display:none">
+        <label>Center (cx, cy):</label>
+        <input type="number" id="el_cx" step="0.5"><input type="number" id="el_cy" step="0.5">
+        <label style="min-width:60px">a (major):</label>
+        <input type="number" id="el_a" step="0.5">
+        <label style="min-width:60px">b (minor):</label>
+        <input type="number" id="el_b" step="0.5">
+    </div>
+    <div class="row" id="ellipse-inputs2" style="display:none">
+        <label>Rotation (deg):</label>
+        <input type="number" id="el_rotation" step="0.5" value="0">
+        <label>θ start (deg):</label>
+        <input type="number" id="el_theta_start" step="1" value="0">
+        <label>θ end (deg):</label>
+        <input type="number" id="el_theta_end" step="1" value="360">
+        <button onclick="applyRegion()">Apply Region</button>
+    </div>
+
+    <h3>Caliper Config</h3>
+    <div class="row">
+        <label>Polarity:</label>
+        <select id="polarity">
+            <option value="any" selected>any</option>
+            <option value="dark_to_bright">dark → bright</option>
+            <option value="bright_to_dark">bright → dark</option>
+        </select>
+        <label># calipers:</label>
+        <input type="number" id="num_calipers" min="3" max="200" step="1" value="15">
+    </div>
+    <div class="row">
+        <label>Caliper width:</label>
+        <input type="number" id="caliper_width" min="1" max="50" step="1" value="5">
+        <label>Search span:</label>
+        <input type="number" id="caliper_span" min="5" max="2000" step="1" value="60">
+    </div>
+    <div class="row">
+        <label>Min edge strength:</label>
+        <input type="number" id="min_edge_strength" min="1" max="255" step="1" value="20">
+        <label>Top-N per caliper:</label>
+        <input type="number" id="top_n_per_caliper" min="1" max="20" step="1" value="1">
+    </div>
+    <div class="row">
+        <label>Peak min sep (px):</label>
+        <input type="number" id="edge_min_separation_px" min="1" max="100" step="1" value="3">
+        <label>Top-N min α:</label>
+        <input type="number" id="top_n_min_alpha" min="0" max="1" step="0.05" value="0">
+    </div>
+    <div class="row">
+        <label>RANSAC thr (px):</label>
+        <input type="number" id="ransac_threshold_px" min="0.1" max="20" step="0.1" value="1.5">
+        <label>Iters (cap):</label>
+        <input type="number" id="ransac_iterations" min="20" max="2000" step="10" value="200">
+    </div>
+    <div class="row">
+        <label>Expected outlier %:</label>
+        <input type="number" id="expected_outlier_rate" min="0" max="0.95" step="0.01" value="0.5">
+        <span class="hint">Lower ⇒ fewer RANSAC iters (5% ≈ 5–10 iters, 50% ≈ cap). Iters-cap above is the ceiling.</span>
+    </div>
+
+    <h3>Polynomial (filter &amp; primitive)</h3>
+    <div class="hint">`poly_degree` is shared: as residual filter after Line/Circle/Ellipse fits, OR as the primitive degree when Fit Model is Polynomial. `poly_max_slope_deg` caps the curve's steepness (Polynomial fit only; 0 = no limit).</div>
+    <div class="row">
+        <label>Residual filter:</label>
+        <input type="checkbox" id="poly_enabled">
+        <label>Degree:</label>
+        <input type="number" id="poly_degree" min="0" max="6" step="1" value="1">
+        <label>Reject σ:</label>
+        <input type="number" id="poly_reject_sigma" min="0.1" max="10" step="0.1" value="2.5">
+    </div>
+    <div class="row">
+        <label>Max slope (deg):</label>
+        <input type="number" id="poly_max_slope_deg" min="0" max="89" step="1" value="0">
+    </div>
+
+    <h3>Inspection Criteria <span class="hint" style="text-transform:none;letter-spacing:0">(0 disables)</span></h3>
+    <div class="row">
+        <label>Min length (px):</label>
+        <input type="number" id="min_length_px" step="1" value="0">
+        <label>Min inlier ratio:</label>
+        <input type="number" id="min_inlier_ratio" min="0" max="1" step="0.01" value="0">
+    </div>
+    <div class="row">
+        <button onclick="applyConfig()">Apply Config</button>
+        <button class="ghost" onclick="refreshStatus()">Refresh</button>
+    </div>
+
+<script>
+    const vscode = acquireVsCodeApi();
+
+    const srcImg      = document.getElementById('src-img');
+    const srcCanvas   = document.getElementById('src-canvas');
+    const sctx        = srcCanvas.getContext('2d');
+    const resultImg   = document.getElementById('result-img');
+    const resultEmpty = document.getElementById('result-empty');
+    const resultInfo  = document.getElementById('result-info');
+    const verdict     = document.getElementById('verdict');
+    const verdictReason = document.getElementById('verdict-reason');
+
+    let previewW = 0, previewH = 0;
+    let line = null;                 // { p1x, p1y, p2x, p2y }
+    let drag = null;                 // 'new' | 'drag-p1' | 'drag-p2'
+    let configHydrated = false;
+    let lineHydrated   = false;
+    let lastResultKey  = null;
+
+    function sizeCanvas() {
+        const r = srcImg.getBoundingClientRect();
+        srcCanvas.width = r.width; srcCanvas.height = r.height;
+        drawOverlay();
+    }
+    srcImg.addEventListener('load', sizeCanvas);
+    window.addEventListener('resize', sizeCanvas);
+
+    function canvasToImage(cx, cy) {
+        if (!previewW || !srcCanvas.width) return [0, 0];
+        return [cx * previewW / srcCanvas.width, cy * previewH / srcCanvas.height];
+    }
+    function imageToCanvas(ix, iy) {
+        if (!previewW || !srcCanvas.width) return [0, 0];
+        return [ix * srcCanvas.width / previewW, iy * srcCanvas.height / previewH];
+    }
+    function distToEndpoint(cx, cy, ix, iy) {
+        const [ex, ey] = imageToCanvas(ix, iy);
+        return Math.hypot(cx - ex, cy - ey);
+    }
+
+    srcCanvas.addEventListener('mousedown', e => {
+        const r = srcCanvas.getBoundingClientRect();
+        const cx = e.clientX - r.left, cy = e.clientY - r.top;
+        if (line) {
+            const d1 = distToEndpoint(cx, cy, line.p1x, line.p1y);
+            const d2 = distToEndpoint(cx, cy, line.p2x, line.p2y);
+            if (d1 < 12 && d1 <= d2) { drag = 'drag-p1'; return; }
+            if (d2 < 12)             { drag = 'drag-p2'; return; }
+        }
+        const [ix, iy] = canvasToImage(cx, cy);
+        line = { p1x: ix, p1y: iy, p2x: ix, p2y: iy };
+        drag = 'new';
+        drawOverlay();
+    });
+    srcCanvas.addEventListener('mousemove', e => {
+        if (!drag) return;
+        const r = srcCanvas.getBoundingClientRect();
+        const cx = e.clientX - r.left, cy = e.clientY - r.top;
+        const [ix, iy] = canvasToImage(cx, cy);
+        if (drag === 'new' || drag === 'drag-p2') { line.p2x = ix; line.p2y = iy; }
+        else if (drag === 'drag-p1')              { line.p1x = ix; line.p1y = iy; }
+        writeLineInputs();
+        drawOverlay();
+    });
+    function endDrag() {
+        if (!drag) return;
+        drag = null;
+        if (line && Math.hypot(line.p2x - line.p1x, line.p2y - line.p1y) > 2) applyRegion();
+    }
+    srcCanvas.addEventListener('mouseup',  endDrag);
+    srcCanvas.addEventListener('mouseleave', endDrag);
+
+    function drawOverlay() {
+        sctx.clearRect(0, 0, srcCanvas.width, srcCanvas.height);
+        if (!line || !previewW) return;
+        const [a1x, a1y] = imageToCanvas(line.p1x, line.p1y);
+        const [a2x, a2y] = imageToCanvas(line.p2x, line.p2y);
+        const dx = a2x - a1x, dy = a2y - a1y;
+        const L  = Math.hypot(dx, dy);
+        if (L < 1) return;
+        const exU = dx / L, eyU = dy / L, exV = -eyU, eyV = exU;
+
+        sctx.save();
+        sctx.setLineDash([5, 4]);
+        sctx.strokeStyle = '#56a0ff';
+        sctx.lineWidth = 1.5;
+        sctx.beginPath(); sctx.moveTo(a1x, a1y); sctx.lineTo(a2x, a2y); sctx.stroke();
+        sctx.restore();
+
+        const N     = +document.getElementById('num_calipers').value || 15;
+        const spanI = +document.getElementById('caliper_span').value  || 60;
+        const widI  = +document.getElementById('caliper_width').value || 5;
+        const scale = srcCanvas.width / (previewW || 1);
+        const span  = spanI * scale;
+        const wid   = Math.max(4, widI) * scale;
+
+        sctx.strokeStyle = '#56a0ff';
+        sctx.lineWidth = 1.0;
+        for (let i = 0; i < N; ++i) {
+            const t  = (i + 0.5) / N;
+            const cx = a1x + (a2x - a1x) * t;
+            const cy = a1y + (a2y - a1y) * t;
+            const hu = wid * 0.5, hv = span * 0.5;
+            const c0x = cx - hu * exU - hv * exV, c0y = cy - hu * eyU - hv * eyV;
+            const c1x = cx + hu * exU - hv * exV, c1y = cy + hu * eyU - hv * eyV;
+            const c2x = cx + hu * exU + hv * exV, c2y = cy + hu * eyU + hv * eyV;
+            const c3x = cx - hu * exU + hv * exV, c3y = cy - hu * eyU + hv * eyV;
+            sctx.beginPath();
+            sctx.moveTo(c0x, c0y); sctx.lineTo(c1x, c1y);
+            sctx.lineTo(c2x, c2y); sctx.lineTo(c3x, c3y); sctx.closePath();
+            sctx.stroke();
+        }
+        const midX = (a1x + a2x) * 0.5, midY = (a1y + a2y) * 0.5;
+        const tipX = midX + exV * (span * 0.5 - 4);
+        const tipY = midY + eyV * (span * 0.5 - 4);
+        sctx.beginPath(); sctx.moveTo(midX, midY); sctx.lineTo(tipX, tipY); sctx.stroke();
+
+        for (const [hx, hy] of [[a1x, a1y], [a2x, a2y]]) {
+            sctx.fillStyle = '#56a0ff';
+            sctx.beginPath(); sctx.arc(hx, hy, 5, 0, Math.PI * 2); sctx.fill();
+            sctx.strokeStyle = '#fff';
+            sctx.lineWidth = 1.5;
+            sctx.beginPath(); sctx.arc(hx, hy, 6, 0, Math.PI * 2); sctx.stroke();
+        }
+    }
+
+    function writeLineInputs() {
+        if (!line) return;
+        document.getElementById('p1x').value = line.p1x.toFixed(1);
+        document.getElementById('p1y').value = line.p1y.toFixed(1);
+        document.getElementById('p2x').value = line.p2x.toFixed(1);
+        document.getElementById('p2y').value = line.p2y.toFixed(1);
+    }
+    function readLineInputs() {
+        return {
+            p1x: +document.getElementById('p1x').value || 0,
+            p1y: +document.getElementById('p1y').value || 0,
+            p2x: +document.getElementById('p2x').value || 0,
+            p2y: +document.getElementById('p2y').value || 0,
+        };
+    }
+
+    function onRegionModeChange() {
+        const mode = document.getElementById('region_mode').value;
+        document.getElementById('line-inputs').style.display        = mode === 'line'        ? '' : 'none';
+        document.getElementById('arc-inputs').style.display         = mode === 'arc'         ? '' : 'none';
+        document.getElementById('arc-inputs2').style.display        = mode === 'arc'         ? '' : 'none';
+        document.getElementById('ellipse-inputs').style.display     = mode === 'ellipse_arc' ? '' : 'none';
+        document.getElementById('ellipse-inputs2').style.display    = mode === 'ellipse_arc' ? '' : 'none';
+        document.getElementById('region-hint-line').style.display        = mode === 'line'        ? '' : 'none';
+        document.getElementById('region-hint-arc').style.display         = mode === 'arc'         ? '' : 'none';
+        document.getElementById('region-hint-ellipse_arc').style.display = mode === 'ellipse_arc' ? '' : 'none';
+        drawOverlay();
+    }
+
+    function readArcInputs() {
+        return {
+            cx:             +document.getElementById('arc_cx').value     || 0,
+            cy:             +document.getElementById('arc_cy').value     || 0,
+            r:              +document.getElementById('arc_r').value      || 0,
+            theta_start_deg:+document.getElementById('arc_theta_start').value || 0,
+            theta_end_deg:  +document.getElementById('arc_theta_end').value   || 360,
+        };
+    }
+    function writeArcInputs(a) {
+        document.getElementById('arc_cx').value          = (+a.cx).toFixed(1);
+        document.getElementById('arc_cy').value          = (+a.cy).toFixed(1);
+        document.getElementById('arc_r').value           = (+a.r).toFixed(1);
+        document.getElementById('arc_theta_start').value = (+a.theta_start_deg).toFixed(1);
+        document.getElementById('arc_theta_end').value   = (+a.theta_end_deg).toFixed(1);
+    }
+
+    function readEllipseInputs() {
+        return {
+            ecx:              +document.getElementById('el_cx').value           || 0,
+            ecy:              +document.getElementById('el_cy').value           || 0,
+            ea:               +document.getElementById('el_a').value            || 0,
+            eb:               +document.getElementById('el_b').value            || 0,
+            rotation_deg:     +document.getElementById('el_rotation').value     || 0,
+            etheta_start_deg: +document.getElementById('el_theta_start').value  || 0,
+            etheta_end_deg:   +document.getElementById('el_theta_end').value    || 360,
+        };
+    }
+    function writeEllipseInputs(e) {
+        document.getElementById('el_cx').value          = (+e.ecx).toFixed(1);
+        document.getElementById('el_cy').value          = (+e.ecy).toFixed(1);
+        document.getElementById('el_a').value           = (+e.ea).toFixed(1);
+        document.getElementById('el_b').value           = (+e.eb).toFixed(1);
+        document.getElementById('el_rotation').value    = (+e.rotation_deg).toFixed(1);
+        document.getElementById('el_theta_start').value = (+e.etheta_start_deg).toFixed(1);
+        document.getElementById('el_theta_end').value   = (+e.etheta_end_deg).toFixed(1);
+    }
+
+    function applyRegion() {
+        const mode = document.getElementById('region_mode').value;
+        let payload = { command: 'set_region', mode };
+        if      (mode === 'line')        { line = readLineInputs(); Object.assign(payload, line); }
+        else if (mode === 'arc')         { Object.assign(payload, readArcInputs()); }
+        else if (mode === 'ellipse_arc') { Object.assign(payload, readEllipseInputs()); }
+        vscode.postMessage({ type: 'exchange', cmd: payload });
+        drawOverlay();
+    }
+    function applyConfig() {
+        const cfg = {
+            command: 'set_config',
+            fit_model:           document.getElementById('fit_model').value,
+            polarity:            document.getElementById('polarity').value,
+            num_calipers:       +document.getElementById('num_calipers').value,
+            caliper_width:      +document.getElementById('caliper_width').value,
+            caliper_span:       +document.getElementById('caliper_span').value,
+            min_edge_strength:  +document.getElementById('min_edge_strength').value,
+            top_n_per_caliper:       +document.getElementById('top_n_per_caliper').value,
+            edge_min_separation_px:  +document.getElementById('edge_min_separation_px').value,
+            top_n_min_alpha:         +document.getElementById('top_n_min_alpha').value,
+            ransac_threshold_px:+document.getElementById('ransac_threshold_px').value,
+            ransac_iterations:  +document.getElementById('ransac_iterations').value,
+            expected_outlier_rate: +document.getElementById('expected_outlier_rate').value,
+            poly_enabled:        document.getElementById('poly_enabled').checked,
+            poly_degree:        +document.getElementById('poly_degree').value,
+            poly_max_slope_deg: +document.getElementById('poly_max_slope_deg').value,
+            poly_reject_sigma:  +document.getElementById('poly_reject_sigma').value,
+            min_length_px:      +document.getElementById('min_length_px').value,
+            min_inlier_ratio:   +document.getElementById('min_inlier_ratio').value,
+        };
+        vscode.postMessage({ type: 'exchange', cmd: cfg });
+        drawOverlay();
+    }
+    function refreshStatus()     { vscode.postMessage({ type: 'exchange', cmd: { command: 'get_status' } }); }
+    function refreshPreview()    { vscode.postMessage({ type: 'exchange', cmd: { command: 'get_preview' } }); }
+    function refreshLastResult() { vscode.postMessage({ type: 'exchange', cmd: { command: 'get_last_result' } }); }
+
+    function applyStatus(s) {
+        if (!configHydrated && 'polarity' in s) {
+            document.getElementById('region_mode').value         = s.region_mode || 'line';
+            document.getElementById('fit_model').value           = s.fit_model   || 'line';
+            onRegionModeChange();
+            if (s.arc)     writeArcInputs(s.arc);
+            if (s.ellipse) writeEllipseInputs(s.ellipse);
+            document.getElementById('polarity').value            = s.polarity;
+            document.getElementById('num_calipers').value        = s.num_calipers;
+            document.getElementById('caliper_width').value       = s.caliper_width;
+            document.getElementById('caliper_span').value        = s.caliper_span;
+            document.getElementById('min_edge_strength').value       = s.min_edge_strength;
+            document.getElementById('top_n_per_caliper').value       = s.top_n_per_caliper ?? 1;
+            document.getElementById('edge_min_separation_px').value  = s.edge_min_separation_px ?? 3;
+            document.getElementById('top_n_min_alpha').value         = s.top_n_min_alpha ?? 0;
+            document.getElementById('ransac_threshold_px').value = s.ransac_threshold_px;
+            document.getElementById('ransac_iterations').value   = s.ransac_iterations;
+            document.getElementById('expected_outlier_rate').value = s.expected_outlier_rate ?? 0.5;
+            document.getElementById('poly_enabled').checked      = !!s.poly_enabled;
+            document.getElementById('poly_degree').value         = s.poly_degree;
+            document.getElementById('poly_max_slope_deg').value  = s.poly_max_slope_deg ?? 0;
+            document.getElementById('poly_reject_sigma').value   = s.poly_reject_sigma;
+            document.getElementById('min_length_px').value       = s.min_length_px;
+            document.getElementById('min_inlier_ratio').value    = s.min_inlier_ratio;
+            configHydrated = true;
+        }
+        if (!lineHydrated && !line && !drag && s.line &&
+            ((+s.line.p2x - +s.line.p1x) !== 0 || (+s.line.p2y - +s.line.p1y) !== 0)) {
+            line = { p1x: +s.line.p1x, p1y: +s.line.p1y,
+                     p2x: +s.line.p2x, p2y: +s.line.p2y };
+            writeLineInputs();
+            drawOverlay();
+            lineHydrated = true;
+        }
+        if (s.found) {
+            verdict.className = 'badge ' + (s.pass ? 'pass' : 'fail');
+            verdict.textContent = s.pass ? 'PASS' : 'FAIL';
+            verdictReason.textContent = s.pass ? '' : ('— ' + (s.fail_reason || ''));
+            document.getElementById('m-angle').textContent  = (s.angle   ?? 0).toFixed(2) + '°';
+            document.getElementById('m-length').textContent = (s.length  ?? 0).toFixed(1) + ' px';
+            document.getElementById('m-in').textContent     = `${s.inlier_count ?? 0}/${s.total_hits ?? 0}`;
+            document.getElementById('m-ratio').textContent  = ((s.inlier_ratio ?? 0) * 100).toFixed(0) + '%';
+            document.getElementById('m-poly').textContent   = s.poly_applied
+                ? `on · ${s.poly_rejected ?? 0} rejected` : 'off';
+            document.getElementById('m-sigma').textContent  = (s.residual_std ?? 0).toFixed(2) + ' px';
+            document.getElementById('m-conf').textContent   = ((s.confidence ?? 0) * 100).toFixed(0) + '%';
+            document.getElementById('m-stab').textContent   = ((s.stability  ?? 0) * 100).toFixed(0) + '%';
+            document.getElementById('m-resmed').textContent = (s.residual_median_px ?? 0).toFixed(2) + ' px';
+        } else {
+            verdict.className = 'badge idle';
+            verdict.textContent = 'IDLE';
+            verdictReason.textContent = s.fail_reason ? ('— ' + s.fail_reason) : '';
+            document.getElementById('m-angle').textContent = document.getElementById('m-length').textContent =
+                document.getElementById('m-in').textContent = document.getElementById('m-ratio').textContent = '—';
+            document.getElementById('m-poly').textContent = document.getElementById('m-sigma').textContent = '—';
+            document.getElementById('m-conf').textContent = document.getElementById('m-stab').textContent =
+                document.getElementById('m-resmed').textContent = '—';
+        }
+        const key = `${s.found ? 1 : 0}:${s.pass ? 1 : 0}:${s.inlier_count ?? 0}:${(s.length ?? 0).toFixed(2)}`;
+        if (key !== lastResultKey) {
+            lastResultKey = key;
+            if (s.found) refreshLastResult(); else applyLastResult({});
+        }
+    }
+
+    function applyLastResult(m) {
+        if (!m.result_png) {
+            resultImg.style.display = 'none';
+            resultEmpty.style.display = 'block';
+            resultInfo.textContent = '';
+            return;
+        }
+        resultImg.src = 'data:image/png;base64,' + m.result_png;
+        resultImg.style.display = 'block';
+        resultEmpty.style.display = 'none';
+        resultInfo.textContent = ` — ${m.result_w}×${m.result_h}` +
+                                 (m.found ? ` · ${m.pass ? 'PASS' : 'FAIL'}` : '');
+    }
+
+    window.addEventListener('message', e => {
+        const m = e.data;
+        if (m.type !== 'status') return;
+        if (typeof m.preview === 'string' && m.preview) {
+            srcImg.src = 'data:image/jpeg;base64,' + m.preview;
+            previewW = m.preview_w; previewH = m.preview_h;
+            return;
+        }
+        if ('result_png' in m) { applyLastResult(m); return; }
+        applyStatus(m);
+    });
+
+    refreshStatus();
+    refreshPreview();
+    setInterval(refreshPreview, 1000);
+    setInterval(refreshStatus, 500);
+</script>
+</body>
+</html>

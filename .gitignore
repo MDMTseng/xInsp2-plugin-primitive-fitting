@@ -1,0 +1,46 @@
+# Build directories
+build/
+lab/build/
+
+# Compiled binaries
+*.dll
+*.exe
+*.lib
+*.exp
+*.obj
+*.pdb
+*.ilk
+*.idb
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CMakeScripts/
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+*.sln
+
+# IDE / editor
+.vs/
+.vscode/
+.vscode-test/
+lab/.vscode-test/
+.idea/
+*.swp
+*~
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Host-generated cert
+cert.json
+
+# Test output images
+tests/screenshots/
+
+# Lab results
+lab/build/
+lab/results/
