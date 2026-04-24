@@ -151,7 +151,10 @@ Defaults (override only what you need):
 | `void start()` / `void stop()` | no-op | streaming sources (cameras) only |
 
 `xi::ImageSource` is a subclass for cameras — adds `grab()` /
-`grab_wait()` and a built-in frame queue with backpressure.
+`grab_wait()` and a built-in frame queue with backpressure. For
+correlated multi-camera capture, use `host()->emit_trigger(...)`
+directly — see the SDK README's *Image sources and the trigger bus*
+section and the `trigger_source/` example.
 
 `name()` returns this instance's name. `host()` returns the host API.
 
