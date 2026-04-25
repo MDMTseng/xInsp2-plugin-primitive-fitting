@@ -29,9 +29,15 @@ add_executable(lab
     algo_constrained_grid.cpp
     algo_constrained_ransac.cpp
     algo_constrained_knot_dp.cpp
+    algo_caliper_cnn.cpp
 )
 target_include_directories(lab PRIVATE ${OpenCV_INCLUDE_DIRS})
 target_link_libraries(lab PRIVATE ${OpenCV_LIBS})
+
+# Caliper-ROI dataset dump tool (separate executable).
+add_executable(dump_caliper_dataset dump_caliper_dataset.cpp scene.cpp)
+target_include_directories(dump_caliper_dataset PRIVATE ${OpenCV_INCLUDE_DIRS})
+target_link_libraries(dump_caliper_dataset PRIVATE ${OpenCV_LIBS})
 
 # /fp:fast is scoped to the tensor-voting translation unit only. Other
 # algorithms (e.g. algo_dijkstra) rely on IEEE +inf semantics which
