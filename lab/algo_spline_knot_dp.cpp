@@ -112,7 +112,8 @@ cv::Mat compute_evidence(const cv::Mat& gray, double y0, int band_half) {
     const double pol = (bot_sum >= top_sum) ? +1.0 : -1.0;
 
     cv::Mat raw(H, W, CV_64F, cv::Scalar(0.0));
-    double e_max = 0.0;
+    std::vector<double> samples;
+    samples.reserve((size_t)(y_hi - y_lo + 1) * W);
     for (int y = y_lo; y <= y_hi; ++y) {
         const uint8_t* rm = gray.ptr<uint8_t>(y - 1);
         const uint8_t* rp = gray.ptr<uint8_t>(y + 1);
@@ -121,13 +122,22 @@ cv::Mat compute_evidence(const cv::Mat& gray, double y0, int band_half) {
             double g = pol * 0.5 * ((double)rp[x] - (double)rm[x]);
             double v = (g > 0.0) ? g : 0.0;
             dst[x] = v;
-            if (v > e_max) e_max = v;
+            if (v > 0) samples.push_back(v);
         }
     }
-    // κ chosen as 0.20 × max — makes a single peak max-sample to ~0.83
-    // and a moderate curve sample (e ≈ 0.5 max) to 0.71, so curve and
-    // spike contributions stay within ~20% of each other.
-    const double kappa = std::max(1.0, 0.20 * e_max);
+    // κ chosen as 0.20 × percentile_90(E) — robust to spike outliers
+    // that would otherwise inflate max(E) in harsh-noise scenes,
+    // making the saturating bend overshoot the curve's typical
+    // contribution. With p90 the "strong but not exceptional"
+    // evidence floor sets the saturation knee correctly even when
+    // a few spikes bring max(E) up by 5–10×.
+    double p90 = 0.0;
+    if (!samples.empty()) {
+        size_t k = (size_t)((samples.size() - 1) * 0.90);
+        std::nth_element(samples.begin(), samples.begin() + k, samples.end());
+        p90 = samples[k];
+    }
+    const double kappa = std::max(1.0, 0.20 * p90);
 
     cv::Mat E(H, W, CV_64F, cv::Scalar(0.0));
     for (int y = y_lo; y <= y_hi; ++y) {
