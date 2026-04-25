@@ -96,6 +96,7 @@ int main(int argc, char** argv) {
         {"subregion_tv_band",   lab::detect_subregion_tv_band},
         {"subregion_tv_strips", lab::detect_subregion_tv_strips},
         {"subregion_dp_strips", lab::detect_subregion_dp_strips},
+        {"spline_knot_dp",      lab::detect_spline_knot_dp},
     };
     std::vector<Agg> aggs(cases.size());
     for (size_t i = 0; i < cases.size(); ++i) aggs[i].name = cases[i].name;

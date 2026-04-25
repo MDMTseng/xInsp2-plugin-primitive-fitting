@@ -107,5 +107,6 @@ std::vector<cv::Point2d> detect_subregion_tv_peaks  (const cv::Mat& gray, const 
 std::vector<cv::Point2d> detect_subregion_tv_band   (const cv::Mat& gray, const GroundTruth& gt);
 std::vector<cv::Point2d> detect_subregion_tv_strips (const cv::Mat& gray, const GroundTruth& gt);
 std::vector<cv::Point2d> detect_subregion_dp_strips (const cv::Mat& gray, const GroundTruth& gt);
+std::vector<cv::Point2d> detect_spline_knot_dp      (const cv::Mat& gray, const GroundTruth& gt);
 
 } // namespace lab
