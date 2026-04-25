@@ -26,6 +26,9 @@ add_executable(lab
     algo_subregion_tv_strips.cpp
     algo_subregion_dp_strips.cpp
     algo_spline_knot_dp.cpp
+    algo_constrained_grid.cpp
+    algo_constrained_ransac.cpp
+    algo_constrained_knot_dp.cpp
 )
 target_include_directories(lab PRIVATE ${OpenCV_INCLUDE_DIRS})
 target_link_libraries(lab PRIVATE ${OpenCV_LIBS})

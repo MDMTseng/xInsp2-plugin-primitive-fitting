@@ -115,6 +115,98 @@ fix α or threshold constants to magic numbers": evidence units should
 be normalised so the score function compares apples to apples across
 sparse spikes and continuous edges.
 
+## Constrained-polynomial search variants (`algo_constrained_*.cpp`)
+
+A user-driven follow-up: instead of free-form spline knots, fit a
+**deg-3 polynomial with explicit derivative box constraints** —
+the user wants to bound max |p'|, |p''|, |p'''| in pixel-space, so
+the curve has user-specified maximum complexity. Three search
+methods over the same constrained problem:
+
+  * **`cpoly_grid`** — coarse-to-fine grid search in (a₁, a₂, a₃)
+    with inner 1-D search for a₀. Within the discretisation it is
+    globally optimal — the "ground truth" for what the constrained
+    polynomial can do.
+  * **`cpoly_ransac`** — random samples of 4 strong-evidence pixels,
+    fit the unique cubic through them, reject constraint violators,
+    score by integrated saturated evidence. PROSAC-flavoured.
+  * **`cpoly_knot_dp`** — same DP backbone as `spline_knot_dp` but
+    with the soft `λ·curv²` penalty replaced by *hard* box
+    constraints derived from `slope_max`, `curv_max`. Curve is
+    still piecewise-linear over knots, not a polynomial — but the
+    constraint structure is the same as the polynomial fit.
+
+All three share `constrained_poly_common.hpp` (saturated evidence,
+`PolyConstraints` struct, `score_poly`, `satisfies` constraint
+check). PolyConstraints defaults: slope ≤ 1.5 px/px, curv ≤ 0.05
+px/px², jerk ≤ 0.005 px/px³ — loose enough to admit every curve
+the lab generator produces.
+
+### Numbers (100 seeds, normal noise)
+
+| Algorithm | RMS p50 | RMS p90 | Coverage | Runtime p50 | Outlier |
+|---|---:|---:|---:|---:|---:|
+| `spline_knot_dp` (reference) | 0.193 | 0.456 | 98.1% | 1.80 ms | 4% |
+| `cpoly_knot_dp`              | 0.209 | 0.419 | 93.7% | 3.80 ms | 12% |
+| `cpoly_grid`                 | 0.707 | 0.849 | 81.6% | 39.7 ms | 25% |
+| `cpoly_ransac`               | 0.761 | 1.168 | 49.0% | 0.35 ms | 62% |
+
+### Numbers (100 seeds, harsh noise)
+
+| Algorithm | RMS p50 | RMS p90 | Coverage | Runtime p50 | Outlier |
+|---|---:|---:|---:|---:|---:|
+| `spline_knot_dp` (reference) | 0.301 | 0.849 | 74.9% | 1.95 ms | 33% |
+| `cpoly_knot_dp`              | 0.384 | 0.850 | 52.3% | 4.06 ms | 64% |
+| `cpoly_grid`                 | 0.719 | 1.147 | 55.4% | 40.2 ms | 54% |
+| `cpoly_ransac`               | 1.104 | 1.203 |  8.2% | 0.38 ms | 100% |
+
+### What we learned
+
+1. **`cpoly_knot_dp` ≈ `spline_knot_dp`.** Replacing the soft
+   curvature *penalty* with a *hard box* loses some flexibility
+   (12% vs 4% outlier on normal) but produces nearly the same
+   RMS. The DP search-method is the right tool either way.
+
+2. **Grid search over polynomial coefficients is the wrong tool.**
+   Even at 9 bins per axis × 25 inner-a₀ bins, `cpoly_grid` posts
+   RMS p50 0.707, outlier 25%, runtime 40 ms. Bumping to 15³ × 33
+   (verified, not committed) lifts to 179 ms but only drops RMS to
+   0.576 and outlier to 18%. The coefficient distribution of real
+   scene curves is *dense*, not sparse — the grid never lands close
+   enough to the true peak, and refinement around the wrong coarse
+   peak doesn't recover.
+
+3. **`cpoly_ransac` (4-point exact-fit cubic) fails completely** on
+   harsh (100% outlier). Random 4-point cubics through edge-pixel
+   candidates are too noisy: a single sub-pixel jitter on any of
+   the 4 points throws the whole cubic off by orders more than the
+   tolerance. The classical caliper-ransac pipeline avoids this by
+   doing LSQ over many inliers (not 4-point exact fit) plus IRLS,
+   and by sampling from per-caliper top-K peaks rather than the
+   raw evidence map.
+
+4. **Expressed via control-points / knots, the constrained problem
+   becomes well-conditioned for DP.** The `cpoly_knot_dp` baseline
+   demonstrates this — the same PolyConstraints box (slope/curv
+   bounds) is *easier* to enforce on adjacent y-bin differences
+   than on monomial coefficients, because the differences correspond
+   directly to local derivatives. This is the variation-diminishing
+   property of B-spline / Bernstein bases, encoded as a discrete
+   bin-difference inequality.
+
+### Recommendation
+
+For production "constrained polynomial" use the `cpoly_knot_dp`
+shape — output piecewise-linear knots (or, if true C² output is
+needed, post-fit a cubic spline through the K knots after DP).
+The grid-search version is a reference baseline only; in practice
+its 40 ms cost buys lower quality than spline-DP at 2 ms.
+
+The single biggest finding is that **monomial-coefficient search
+spaces are ill-suited to dense data** — the obvious-looking
+"discretise the polynomial" approach is not a viable replacement
+for either RANSAC or knot DP.
+
 ## RANSAC variants A/B/C/D (`algo_caliper_ransac_variants.cpp`)
 
 Four parametric switches over the same caliper + adaptive-degree
