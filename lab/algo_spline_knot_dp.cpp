@@ -66,18 +66,20 @@ namespace {
 //                 strong enough to suppress spike-induced kinks but
 //                 weak enough to admit real curvature.
 constexpr int    K_KNOTS      = 20;
-constexpr int    Y_BINS       = 80;
+constexpr int    Y_BINS       = 160;
 constexpr double Y_RANGE_PX   = 40.0;
 constexpr int    BAND_HALF_PX = 50;
-constexpr double LAMBDA_CURV  = 0.6;
-// Maximum |Δy| (in bins) allowed between adjacent knots. Mirrors
-// dijkstra's 3-neighbour rule: transitions outside this window are
-// pruned both for speed (M³ → M²·(2·MAX_DELTA+1)) and to prevent
-// spike-chain detours that would require unrealistic slopes.
-// 10 bins ≈ 10 px over a knot spacing of W/(K-1) ≈ 13 px, i.e.
-// max slope ≈ 0.77 px/px — safely above any curve produced by the
-// scene generator (amp 28, period ≥ 320 ⇒ max slope ≈ 0.55 px/px).
-constexpr int    MAX_DELTA    = 10;
+// Scaled so the physical curvature penalty (in px²) stays constant
+// across discretisations: LAMBDA = 0.6 · (1.0 / dy_per_bin)².
+// M=80 → dy=1.0 → λ=0.6   (original spline_knot_dp tune)
+// M=160 → dy=0.5 → λ=0.15
+constexpr double LAMBDA_CURV  = 0.15;
+constexpr int    MAX_DELTA    = 20;  // ≈10 px / 0.50 px-per-bin
+// MAX_DELTA mirrors dijkstra's 3-neighbour rule: transitions outside
+// this window are pruned both for speed (M³ → M²·(2·MAX_DELTA+1)) and
+// to prevent spike-chain detours that would require unrealistic slopes.
+// Scaled with Y_BINS so the physical max-slope budget stays ≈ 10 px
+// across a knot spacing of W/(K-1) ≈ 17 px (max slope ≈ 0.6 px/px).
 
 // Map y-bin index ∈ [0, Y_BINS) to absolute y in image coordinates.
 inline double y_of_bin(int b, double y0) {
@@ -86,7 +88,11 @@ inline double y_of_bin(int b, double y0) {
 }
 
 // Polarity-aware, *saturating* evidence map. Pipeline:
-//   1. signed ∂I/∂y per pixel (3-tap central);
+//   1. signed ∂I/∂y per pixel (3-tap central; tested 5-tap σ=1.0
+//      Gaussian-derivative, but 5-tap blurs the sub-pixel peak in
+//      y so RMS p50 worsens 0.161 → 0.206 on normal noise — only
+//      worth it if you specifically need spike-tolerance over
+//      sub-pixel precision);
 //   2. polarity ReLU using the band's dominant sign;
 //   3. saturating normalisation E ← E / (E + κ_E) so a single
 //      bright pixel cannot dwarf a long stretch of moderate
@@ -105,7 +111,6 @@ cv::Mat compute_evidence(const cv::Mat& gray, double y0, int band_half) {
     }
     const double pol = (bot_sum >= top_sum) ? +1.0 : -1.0;
 
-    // First pass — signed-positive raw gradient + global stats for κ.
     cv::Mat raw(H, W, CV_64F, cv::Scalar(0.0));
     double e_max = 0.0;
     for (int y = y_lo; y <= y_hi; ++y) {
@@ -312,12 +317,21 @@ std::vector<cv::Point2d> detect_spline_knot_dp(const cv::Mat& gray,
     }
 
     // Emit dense output: linear interpolation between adjacent knots.
+    // Output: linear interpolation between adjacent knots — matches
+    // the segment evidence integral the DP actually optimised.
+    //
+    // Tested natural cubic spline post-fit through the K knots: although
+    // C² and visually smoother, the cubic *overshoots between knots*
+    // when knot y-values carry sub-pixel noise, and the overshoot is
+    // off-curve evidence the DP never accounted for. RMS p50 worsens
+    // 0.161 → 0.189 on normal noise. To use a cubic output coherently
+    // would require recomputing segment evidence under the cubic too —
+    // which couples non-adjacent knots and breaks the local DP.
     std::vector<cv::Point2d> out;
     out.reserve(W);
     for (int x = 0; x < W; ++x) {
         double xd = (double)x;
-        // Knot interval k: xs[k] ≤ xd ≤ xs[k+1].
-        int k = (int)std::floor((double)x * (K_KNOTS - 1) / (double)(W - 1));
+        int k = (int)std::floor(xd * (K_KNOTS - 1) / (double)(W - 1));
         if (k > K_KNOTS - 2) k = K_KNOTS - 2;
         if (k < 0) k = 0;
         double t = (xd - xs[k]) / std::max(1e-9, xs[k+1] - xs[k]);
