@@ -65,7 +65,7 @@ namespace {
 //                 about 5% of a typical segment's edge integral —
 //                 strong enough to suppress spike-induced kinks but
 //                 weak enough to admit real curvature.
-constexpr int    K_KNOTS      = 25;
+constexpr int    K_KNOTS      = 20;
 constexpr int    Y_BINS       = 80;
 constexpr double Y_RANGE_PX   = 40.0;
 constexpr int    BAND_HALF_PX = 50;
@@ -181,74 +181,102 @@ std::vector<cv::Point2d> detect_spline_knot_dp(const cv::Mat& gray,
         xs[i] = (double)(W - 1) * (double)i / (double)(K_KNOTS - 1);
     }
 
-    // Pre-compute segment integrals seg[k][a][b].
-    std::vector<std::vector<std::vector<double>>> seg(
-        K_KNOTS - 1,
-        std::vector<std::vector<double>>(Y_BINS, std::vector<double>(Y_BINS, 0.0)));
+    // Flat-array layout for cache locality and clean OpenMP.
+    //   seg [k][a][b]   = seg_flat [k*MM + a*M + b]   (K-1 × M × M doubles)
+    //   dp  [i][a][b]   = dp_flat  [i*MM + a*M + b]   (K   × M × M doubles)
+    //   pred[i][a][b]   = pred_flat[i*MM + a*M + b]   (K   × M × M int16)
+    constexpr int M  = Y_BINS;
+    constexpr int MM = M * M;
+    std::vector<double>  seg_flat ((K_KNOTS - 1) * MM, 0.0);
+    std::vector<double>  dp_flat  (K_KNOTS * MM, -1e30);
+    std::vector<int16_t> pred_flat(K_KNOTS * MM, -1);
+
+    // Segment precompute, parallel over k. Each line integral is pure
+    // (reads E only), so threads do not race.
+    #pragma omp parallel for schedule(static)
     for (int k = 0; k < K_KNOTS - 1; ++k) {
-        for (int a = 0; a < Y_BINS; ++a) {
+        double* sk = &seg_flat[(size_t)k * MM];
+        double xa = xs[k], xb = xs[k+1];
+        for (int a = 0; a < M; ++a) {
             double ya = y_of_bin(a, y0);
-            for (int b = 0; b < Y_BINS; ++b) {
-                double yb = y_of_bin(b, y0);
-                seg[k][a][b] = integrate_line(E, xs[k], ya, xs[k+1], yb,
-                                              band_lo, band_hi);
+            double* row = sk + (size_t)a * M;
+            int b_lo = std::max(0, a - MAX_DELTA);
+            int b_hi = std::min(M - 1, a + MAX_DELTA);
+            for (int b = b_lo; b <= b_hi; ++b) {
+                row[b] = integrate_line(E, xa, ya,
+                                        xb, y_of_bin(b, y0),
+                                        band_lo, band_hi);
             }
         }
     }
 
-    // DP table dp[i][a][b] = best score reaching knot i with
-    //   y_{i-1} = bin a, y_i = bin b.
-    // Predecessor pred[i][a][b] = bin index of y_{i-2}.
     constexpr double NEG_INF = -1e30;
-    std::vector<std::vector<std::vector<double>>> dp(
-        K_KNOTS,
-        std::vector<std::vector<double>>(Y_BINS, std::vector<double>(Y_BINS, NEG_INF)));
-    std::vector<std::vector<std::vector<int16_t>>> pred(
-        K_KNOTS,
-        std::vector<std::vector<int16_t>>(Y_BINS, std::vector<int16_t>(Y_BINS, -1)));
 
     // Seed at i=1: dp[1][a][b] = seg[0][a][b] (no curvature term yet —
     // need three consecutive knots for a curvature triple). Skip
     // (a, b) pairs that exceed the per-knot Δy budget.
-    for (int a = 0; a < Y_BINS; ++a) {
-        int b_lo = std::max(0, a - MAX_DELTA);
-        int b_hi = std::min(Y_BINS - 1, a + MAX_DELTA);
-        for (int b = b_lo; b <= b_hi; ++b)
-            dp[1][a][b] = seg[0][a][b];
+    {
+        const double* s0 = &seg_flat[0];
+        double*       d1 = &dp_flat[(size_t)1 * MM];
+        for (int a = 0; a < M; ++a) {
+            int b_lo = std::max(0, a - MAX_DELTA);
+            int b_hi = std::min(M - 1, a + MAX_DELTA);
+            for (int b = b_lo; b <= b_hi; ++b)
+                d1[a * M + b] = s0[a * M + b];
+        }
     }
 
-    // Forward pass: i = 1 .. K_KNOTS-2 transitions to i+1.
-    // Transition c is restricted to |c − b| ≤ MAX_DELTA so the jump
-    // between adjacent knots respects the maximum realistic slope.
+    // Forward pass over flat arrays. For each (i, b), we collect the
+    // best (a → b → c) triple — but inverting the inner loops to fix
+    // (b, c) and scan a is more cache-friendly because seg[i][b][c]
+    // becomes a single load and dp[i][a][b] is contiguous in a along
+    // a slice of constant b. Also pre-tabulate the curvature penalty
+    // p[a, c] = LAMBDA · (c - 2b + a)² as a function of (a) for fixed
+    // (b, c) — actually faster to inline since the squared term is
+    // cheap and we avoid an extra table.
     for (int i = 1; i < K_KNOTS - 1; ++i) {
-        for (int a = 0; a < Y_BINS; ++a) {
-            for (int b = 0; b < Y_BINS; ++b) {
-                double base = dp[i][a][b];
+        const double* dpi   = &dp_flat[(size_t)i * MM];
+        const double* segi  = &seg_flat[(size_t)i * MM];
+        double*       dpi1  = &dp_flat[(size_t)(i + 1) * MM];
+        int16_t*      predi = &pred_flat[(size_t)(i + 1) * MM];
+        for (int a = 0; a < M; ++a) {
+            const double* dpi_a = dpi + (size_t)a * M;
+            int b_lo_outer = std::max(0, a - MAX_DELTA);
+            int b_hi_outer = std::min(M - 1, a + MAX_DELTA);
+            for (int b = b_lo_outer; b <= b_hi_outer; ++b) {
+                double base = dpi_a[b];
                 if (base <= NEG_INF / 2) continue;
+                const double* segi_b = segi + (size_t)b * M;
+                double*       dpi1_b = dpi1 + (size_t)b * M;
+                int16_t*      pred_b = predi + (size_t)b * M;
                 int c_lo = std::max(0, b - MAX_DELTA);
-                int c_hi = std::min(Y_BINS - 1, b + MAX_DELTA);
+                int c_hi = std::min(M - 1, b + MAX_DELTA);
+                int two_b_minus_a = 2 * b - a;
                 for (int c = c_lo; c <= c_hi; ++c) {
-                    double curv = (double)(c - 2 * b + a);
-                    double score = base + seg[i][b][c]
-                                 - LAMBDA_CURV * curv * curv;
-                    if (score > dp[i+1][b][c]) {
-                        dp[i+1][b][c] = score;
-                        pred[i+1][b][c] = (int16_t)a;
+                    double curv  = (double)(c - two_b_minus_a);
+                    double score = base + segi_b[c] - LAMBDA_CURV * curv * curv;
+                    if (score > dpi1_b[c]) {
+                        dpi1_b[c] = score;
+                        pred_b[c] = (int16_t)a;
                     }
                 }
             }
         }
     }
 
-    // Find best (a, b) at the final knot.
+    // Find best (a, b) at the final knot, using the flat dp array.
+    auto dp_at = [&](int i, int a, int b) -> double& {
+        return dp_flat[(size_t)i * MM + (size_t)a * M + b];
+    };
+    auto pred_at = [&](int i, int a, int b) -> int16_t& {
+        return pred_flat[(size_t)i * MM + (size_t)a * M + b];
+    };
     double best = NEG_INF;
     int best_a = 0, best_b = 0;
-    for (int a = 0; a < Y_BINS; ++a) {
-        for (int b = 0; b < Y_BINS; ++b) {
-            if (dp[K_KNOTS - 1][a][b] > best) {
-                best   = dp[K_KNOTS - 1][a][b];
-                best_a = a; best_b = b;
-            }
+    for (int a = 0; a < M; ++a) {
+        for (int b = 0; b < M; ++b) {
+            double v = dp_at(K_KNOTS - 1, a, b);
+            if (v > best) { best = v; best_a = a; best_b = b; }
         }
     }
 
@@ -257,13 +285,11 @@ std::vector<cv::Point2d> detect_spline_knot_dp(const cv::Mat& gray,
     path[K_KNOTS - 1] = best_b;
     path[K_KNOTS - 2] = best_a;
     for (int i = K_KNOTS - 1; i >= 2; --i) {
-        path[i - 2] = pred[i][path[i - 1]][path[i]];
+        path[i - 2] = pred_at(i, path[i - 1], path[i]);
     }
 
-    // Sub-pixel refinement at each knot via parabolic interpolation on
-    // the dp values across y-bins. We refine y_i using the row dp[i][·][b]
-    // marginal — at the recovered (a, b, c) triple, the local quadratic
-    // around bin b in dp[i][a][·] gives a sub-pixel offset.
+    // Sub-pixel refinement: parabolic interpolation across y-bins of
+    // the dp value at the recovered triple.
     auto refine_bin = [](double d_prev, double d_curr, double d_next) {
         double denom = d_prev - 2.0 * d_curr + d_next;
         if (std::abs(denom) < 1e-12) return 0.0;
@@ -275,19 +301,14 @@ std::vector<cv::Point2d> detect_spline_knot_dp(const cv::Mat& gray,
     for (int i = 0; i < K_KNOTS; ++i) {
         int b = path[i];
         double off = 0.0;
-        if (b > 0 && b < Y_BINS - 1) {
-            // Use dp[i][·][b] (last-axis fixed) marginalised over prev a:
-            // simpler to just use the chosen a from path[i-1].
-            int a = (i >= 1) ? path[i - 1] : path[i];
-            int next_a = a;
-            if (i >= 1) {
-                off = refine_bin(dp[i][next_a][b - 1],
-                                 dp[i][next_a][b],
-                                 dp[i][next_a][b + 1]);
-            }
+        if (i >= 1 && b > 0 && b < M - 1) {
+            int a = path[i - 1];
+            off = refine_bin(dp_at(i, a, b - 1),
+                             dp_at(i, a, b),
+                             dp_at(i, a, b + 1));
         }
         y_path[i] = y_of_bin(b, y0) + off
-                  * (2.0 * Y_RANGE_PX / (double)(Y_BINS - 1));
+                  * (2.0 * Y_RANGE_PX / (double)(M - 1));
     }
 
     // Emit dense output: linear interpolation between adjacent knots.
