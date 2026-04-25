@@ -22,6 +22,76 @@ No algorithm overfits to any specific scene — parameters are either principled
 
 (Outlier scenes = fraction of scenes where the algorithm emitted ≥ 5 points that are > 10 px from ground truth.)
 
+## RANSAC variants A/B/C/D (`algo_caliper_ransac_variants.cpp`)
+
+Four parametric switches over the same caliper + adaptive-degree
+RANSAC core, isolating one improvement axis each:
+
+- **A** — Baseline (mirror of `algo_caliper_ransac.cpp`).
+- **B** — A + cluster early termination. Track top-3 (coeffs, score)
+  per degree; every 5 iters compute max pairwise curve-L2 over 21
+  u-points and break when < 0.3 px.
+- **C** — A + SPRT inner rejection. Inlier counting is batched (size
+  8); after each batch test if the hypothesis can plausibly beat
+  `deg_best_score` and abort the per-hit loop early if not.
+- **D** — B + C + Tukey biweight replacing Huber in IRLS refinement.
+
+### Normal noise (5–50 spikes, 2–5 stripes, σ ∈ [0, 6])
+
+| Variant | RMS p50 | RMS p90 | ms p50 | ms p90 | Outlier |
+|---|---:|---:|---:|---:|---:|
+| A baseline       | 0.200 | 0.784 | 0.299 | 0.453 |  4.0% |
+| B cluster_stop   | 0.213 | 0.784 | 0.308 | 0.449 |  4.0% |
+| C SPRT           | 0.200 | 0.784 | **0.294** | **0.441** |  4.0% |
+| D B+C+Tukey      | 0.204 | 0.779 | 0.292 | 0.446 |  4.0% |
+
+**All four are statistically indistinguishable.** The lab baseline
+already runs only `RANSAC_ITERS_BASE = 45` iters per degree thanks
+to PROSAC strength-ordered sampling — so B/C have almost no
+iter budget to cut, and the cluster-check + SPRT-bound overheads
+roughly cancel the savings. Only **C is a clean ~2% gain**.
+
+### Harsh noise (20–100 spikes, 6–12 stripes, σ ∈ [0, 12])
+
+| Variant | RMS p50 | RMS p90 | ms p50 | ms p90 | Outlier |
+|---|---:|---:|---:|---:|---:|
+| A baseline       | 0.042 | 1.238 | 0.398 | 0.471 | 84% |
+| B cluster_stop   | 0.000 | 1.163 | 0.404 | 0.502 | 84% |
+| C SPRT           | 0.042 | 1.238 | **0.390** | **0.463** | 84% |
+| D B+C+Tukey      | 0.000 | 1.170 | 0.391 | 0.507 | 84% |
+
+**Outlier rate hits 84% across all four** — the `caliper_ransac`
+family as a whole is overwhelmed at this noise density. The
+seemingly-better RMS p50 = 0.000 of B / D is a statistical artifact:
+when more than half the scenes produced inlier_count=0 (recorded as
+RMS=0), the median falls to 0 not because the fit is precise but
+because the failure rate crosses 50%.
+
+The honest reading on harsh:
+- **C** still adds a small speedup, no quality cost.
+- **B / D** add overhead in this harsh regime without buying
+  anything; Tukey's redescending weights zero out too many points
+  when the dominant-outlier fraction is high.
+- **The whole family is the wrong tool here**. `dijkstra_path` (DP
+  with smoothness prior) caps at **47% outlier scenes** in harsh
+  vs caliper_ransac's 84% — the path forward at this stress level
+  is a different algorithm class, not more RANSAC tuning.
+
+### Takeaways
+
+1. **C (SPRT) is the only safe, free improvement** — port it into the
+   production plugin's RANSAC where the iter cap is ≥200 and there's
+   real budget to compress per-iter cost.
+2. **B (cluster early termination)** needs a fat iter budget to pay
+   off (≥150 iters); lab's already-tuned 45–85 budget gives it
+   nothing to cut. Worth re-evaluating in production where the
+   `expected_outlier_rate=0.5` default leaves a 200-iter ceiling.
+3. **D (Tukey)** is quality-not-speed and only helps when the
+   inlier set is genuinely tight; redescending weights hurt under
+   heavy contamination. Stick with Huber as the production default.
+4. **Architectural switch wins over RANSAC tuning** at extreme
+   stress — confirmed again by the harsh-mode outlier rates.
+
 ## Subregion-frontend experiments (tensor voting)
 
 Three sparsification attempts for tensor voting, after the `caliper_dp`

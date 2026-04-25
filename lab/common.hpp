@@ -97,6 +97,10 @@ std::vector<cv::Point2d> detect_dp             (const cv::Mat& gray, const Groun
 std::vector<cv::Point2d> detect_dijkstra       (const cv::Mat& gray, const GroundTruth& gt);
 std::vector<cv::Point2d> detect_tensor_voting  (const cv::Mat& gray, const GroundTruth& gt);
 std::vector<cv::Point2d> detect_caliper_ransac (const cv::Mat& gray, const GroundTruth& gt);
+std::vector<cv::Point2d> detect_caliper_ransac_A(const cv::Mat& gray, const GroundTruth& gt);
+std::vector<cv::Point2d> detect_caliper_ransac_B(const cv::Mat& gray, const GroundTruth& gt);
+std::vector<cv::Point2d> detect_caliper_ransac_C(const cv::Mat& gray, const GroundTruth& gt);
+std::vector<cv::Point2d> detect_caliper_ransac_D(const cv::Mat& gray, const GroundTruth& gt);
 std::vector<cv::Point2d> detect_caliper_dp          (const cv::Mat& gray, const GroundTruth& gt);
 std::vector<cv::Point2d> detect_caliper_dp_poly     (const cv::Mat& gray, const GroundTruth& gt);
 std::vector<cv::Point2d> detect_subregion_tv_peaks  (const cv::Mat& gray, const GroundTruth& gt);

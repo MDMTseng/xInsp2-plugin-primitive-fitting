@@ -18,6 +18,7 @@ add_executable(lab
     algo_dijkstra.cpp
     algo_tensor_voting.cpp
     algo_caliper_ransac.cpp
+    algo_caliper_ransac_variants.cpp
     algo_caliper_dp.cpp
     algo_caliper_dp_poly.cpp
     algo_subregion_tv_peaks.cpp
