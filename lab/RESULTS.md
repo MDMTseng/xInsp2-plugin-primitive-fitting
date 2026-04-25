@@ -22,6 +22,99 @@ No algorithm overfits to any specific scene — parameters are either principled
 
 (Outlier scenes = fraction of scenes where the algorithm emitted ≥ 5 points that are > 10 px from ground truth.)
 
+## Globally-optimal knot DP (`algo_spline_knot_dp.cpp`)
+
+The closest practical relative of "find the polynomial maximizing
+∫ E(x, p_θ(x)) dx" — replace global polynomial with a piecewise-linear
+curve over K knots and solve via Viterbi DP with a curvature
+regulariser. Within the (K, M) discretisation the result is
+**globally optimal** — no random restarts, no local-minimum traps.
+
+### Mechanism
+
+1. **Evidence map**: polarity-aware ∂I/∂y followed by a saturating
+   normalisation `E ← E/(E+κ)` with `κ = 0.20 × max(E)`. Without the
+   saturation a single bright pixel dwarfs a long stretch of moderate
+   evidence and spike chains can outscore the curve under sum-of-evidence;
+   with it, contributions are bounded so a continuous moderately-strong
+   curve wins.
+2. **K=20 knots** evenly spaced across x; **M=80 y-bins** spanning
+   ±40 px around the midline.
+3. **DP state** `(y_{i-1}, y_i)` per knot. Transitions to `c = y_{i+1}`
+   are restricted to `|c - b| ≤ MAX_DELTA = 10` (mirrors dijkstra's
+   3-neighbour rule, so per-segment slope cannot exceed the scene
+   generator's maximum 0.55 px/px).
+4. **Curvature penalty** `λ · (c - 2b + a)²` with `λ = 0.6` in the
+   normalised-evidence units. Tuned so a real-curve curvature of
+   ≈2 bins costs ~5% of segment evidence; spike-induced kinks
+   (5+ bins) pay 25× more and can never beat a smooth fit.
+5. **Sub-pixel refinement** at each knot via parabolic interpolation
+   on the dp values across adjacent y-bins.
+6. **Output**: linear interpolation between adjacent knots at every
+   integer x.
+
+### Implementation tricks
+
+- Flat 1-D arrays for `dp / pred / seg` instead of nested `vector` —
+  three-pointer indirection per access dropped to one. ~3× faster.
+- Segment precompute parallelised with `#pragma omp parallel for` over
+  `k` (each `integrate_line` is a pure read of the evidence map).
+- DP inner loops re-ordered so `seg[i][b][·]` and `dp[i+1][b][·]` slices
+  stay in L1 cache for the entire `c` scan.
+
+### Numbers (100 seeds, normal noise)
+
+| Algorithm | RMS p50 | RMS p90 | Coverage | Runtime p50 | Outlier |
+|---|---:|---:|---:|---:|---:|
+| `spline_knot_dp` | **0.193** | 0.456 | **98.1%** | 1.92 ms | 4% |
+| `caliper_ransac` | 0.200 | 0.784 | 96.0% | 0.35 ms | 4% |
+| `tensor_voting` | 0.221 | 0.473 | 74.7% | 9.87 ms | 92% |
+| `dijkstra_path` | 0.310 | 0.498 | 96.3% | 0.29 ms | 3% |
+
+`spline_knot_dp` posts the **lowest RMS p50** among all algorithms —
+narrowly beating `caliper_ransac` (0.200) and convincingly beating
+`tensor_voting` (0.221) and `dijkstra_path` (0.310). At 1.92 ms it is
+~7× the cost of `dijkstra_path` but ~5× cheaper than `tensor_voting`.
+
+### Numbers (100 seeds, harsh noise)
+
+20–100 spikes, 6–12 stripes, σ ∈ [0, 12].
+
+| Algorithm | RMS p50 | RMS p90 | Coverage | Runtime p50 | Outlier |
+|---|---:|---:|---:|---:|---:|
+| `spline_knot_dp` | 0.301 | 0.849 | **74.9%** | 1.95 ms | **33%** |
+| `dijkstra_path`  | 0.521 | 0.741 | 62.5% | 0.32 ms | 47% |
+| `caliper_ransac` | 0.042* | 1.238 | 20.9% | 0.44 ms | 84% |
+| `tensor_voting`  | 0.436 | 0.761 | 37.6% | 16.0 ms | 100% |
+
+*caliper_ransac p50 ≈ 0 because its outlier rate exceeds 50% — most
+scenes record `inlier_count = 0` whose RMS counts as 0.
+
+`spline_knot_dp` and `dijkstra_path` are the only two algorithms that
+keep outlier rate below 50% on harsh scenes. The DP-with-prior family
+is the right tool at this stress level; RANSAC and tensor voting both
+collapse.
+
+### When to use what
+
+| Goal | Pick |
+|---|---|
+| Sub-millisecond, robust enough | `dijkstra_path` |
+| Best p50 RMS, sub-pixel precision needed | **`spline_knot_dp`** |
+| Existing RANSAC pipeline, mild noise | `caliper_ransac` |
+| Highest stress (harsh) | `spline_knot_dp` (lowest outlier rate) |
+
+### Tuning summary
+
+The single highest-leverage decision is the **saturating evidence
+normalisation**. The first version with raw `Σ |∂I/∂y|` posted RMS p50
+0.288, coverage 78%, outlier 31%. Switching to `E/(E+κ)` improved every
+metric in one stroke (0.288→0.209, 78%→98%, 31%→4%) without changing
+the DP at all. The lesson is the same one already noted under "Never
+fix α or threshold constants to magic numbers": evidence units should
+be normalised so the score function compares apples to apples across
+sparse spikes and continuous edges.
+
 ## RANSAC variants A/B/C/D (`algo_caliper_ransac_variants.cpp`)
 
 Four parametric switches over the same caliper + adaptive-degree
