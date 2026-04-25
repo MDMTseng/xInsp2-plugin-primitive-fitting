@@ -100,7 +100,13 @@ inline bool satisfies(const std::vector<double>& coeffs,
 //   1. signed ∂I/∂y (3-tap central);
 //   2. ReLU with band's dominant polarity (lab convention: dark→bright,
 //      curve has + gradient);
-//   3. saturating normalisation E ← E/(E+κ),  κ = 0.20·max(E).
+//   3. saturating normalisation E ← E/(E+κ).  κ = 0.20·percentile_90(E).
+//      The 90th-percentile knee is robust to spike outliers — under
+//      harsh noise a few spike pixels otherwise inflate max(E) by
+//      5-10×, pushing κ so high that the saturating bend smothers the
+//      curve's typical contribution. p90 tracks 'typical strong
+//      evidence' rather than 'any extreme value', so the saturation
+//      knee stays at the right scale even when extreme values exist.
 inline cv::Mat compute_saturated_evidence(const cv::Mat& gray, double y0,
                                           int band_half) {
     const int H = gray.rows, W = gray.cols;
@@ -115,7 +121,8 @@ inline cv::Mat compute_saturated_evidence(const cv::Mat& gray, double y0,
     const double pol = (bot_sum >= top_sum) ? +1.0 : -1.0;
 
     cv::Mat raw(H, W, CV_64F, cv::Scalar(0.0));
-    double e_max = 0.0;
+    std::vector<double> samples;
+    samples.reserve((size_t)(y_hi - y_lo + 1) * W);
     for (int y = y_lo; y <= y_hi; ++y) {
         const uint8_t* rm = gray.ptr<uint8_t>(y - 1);
         const uint8_t* rp = gray.ptr<uint8_t>(y + 1);
@@ -124,10 +131,16 @@ inline cv::Mat compute_saturated_evidence(const cv::Mat& gray, double y0,
             double g = pol * 0.5 * ((double)rp[x] - (double)rm[x]);
             double v = (g > 0.0) ? g : 0.0;
             dst[x] = v;
-            if (v > e_max) e_max = v;
+            if (v > 0.0) samples.push_back(v);
         }
     }
-    const double kappa = std::max(1.0, 0.20 * e_max);
+    double p90 = 0.0;
+    if (!samples.empty()) {
+        size_t k = (size_t)((samples.size() - 1) * 0.90);
+        std::nth_element(samples.begin(), samples.begin() + k, samples.end());
+        p90 = samples[k];
+    }
+    const double kappa = std::max(1.0, 0.20 * p90);
 
     cv::Mat E(H, W, CV_64F, cv::Scalar(0.0));
     for (int y = y_lo; y <= y_hi; ++y) {

@@ -38,6 +38,7 @@
 //
 
 #include "common.hpp"
+#include "constrained_poly_common.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -87,82 +88,13 @@ inline double y_of_bin(int b, double y0) {
          + 2.0 * Y_RANGE_PX * (double)b / (double)(Y_BINS - 1);
 }
 
-// Polarity-aware, *saturating* evidence map. Pipeline:
-//   1. signed ∂I/∂y per pixel (3-tap central; tested 5-tap σ=1.0
-//      Gaussian-derivative, but 5-tap blurs the sub-pixel peak in
-//      y so RMS p50 worsens 0.161 → 0.206 on normal noise — only
-//      worth it if you specifically need spike-tolerance over
-//      sub-pixel precision);
-//   2. polarity ReLU using the band's dominant sign;
-//   3. saturating normalisation E ← E / (E + κ_E) so a single
-//      bright pixel cannot dwarf a long stretch of moderate
-//      evidence. This mimics the 1/evidence cost dijkstra uses:
-//      spike chains earn high evidence only at sparse peaks and
-//      can no longer outscore a continuous moderately-strong curve.
-cv::Mat compute_evidence(const cv::Mat& gray, double y0, int band_half) {
-    const int H = gray.rows, W = gray.cols;
-    const int y_lo = std::max(1,     (int)std::round(y0 - band_half));
-    const int y_hi = std::min(H - 2, (int)std::round(y0 + band_half));
-
-    long long top_sum = 0, bot_sum = 0;
-    for (int x = 0; x < W; ++x) {
-        top_sum += gray.ptr<uint8_t>(y_lo)[x];
-        bot_sum += gray.ptr<uint8_t>(y_hi)[x];
-    }
-    const double pol = (bot_sum >= top_sum) ? +1.0 : -1.0;
-
-    cv::Mat raw(H, W, CV_64F, cv::Scalar(0.0));
-    std::vector<double> samples;
-    samples.reserve((size_t)(y_hi - y_lo + 1) * W);
-    for (int y = y_lo; y <= y_hi; ++y) {
-        const uint8_t* rm = gray.ptr<uint8_t>(y - 1);
-        const uint8_t* rp = gray.ptr<uint8_t>(y + 1);
-        double* dst = raw.ptr<double>(y);
-        for (int x = 0; x < W; ++x) {
-            double g = pol * 0.5 * ((double)rp[x] - (double)rm[x]);
-            double v = (g > 0.0) ? g : 0.0;
-            dst[x] = v;
-            if (v > 0) samples.push_back(v);
-        }
-    }
-    // κ chosen as 0.20 × percentile_90(E) — robust to spike outliers
-    // that would otherwise inflate max(E) in harsh-noise scenes,
-    // making the saturating bend overshoot the curve's typical
-    // contribution. With p90 the "strong but not exceptional"
-    // evidence floor sets the saturation knee correctly even when
-    // a few spikes bring max(E) up by 5–10×.
-    double p90 = 0.0;
-    if (!samples.empty()) {
-        size_t k = (size_t)((samples.size() - 1) * 0.90);
-        std::nth_element(samples.begin(), samples.begin() + k, samples.end());
-        p90 = samples[k];
-    }
-    const double kappa = std::max(1.0, 0.20 * p90);
-
-    cv::Mat E(H, W, CV_64F, cv::Scalar(0.0));
-    for (int y = y_lo; y <= y_hi; ++y) {
-        const double* src = raw.ptr<double>(y);
-        double* dst = E.ptr<double>(y);
-        for (int x = 0; x < W; ++x) {
-            dst[x] = src[x] / (src[x] + kappa);
-        }
-    }
-    return E;
-}
-
-// Bilinear sample of a CV_64F image at (x, y). x is integer (we always
-// sample at unit-x); y is sub-pixel. Returns 0 outside the y-band.
-inline double sample_y(const cv::Mat& E, int x, double y, int band_lo, int band_hi) {
-    int yi = (int)std::floor(y);
-    if (yi < band_lo || yi >= band_hi) return 0.0;
-    double dy = y - (double)yi;
-    const double* row0 = E.ptr<double>(yi);
-    const double* row1 = E.ptr<double>(yi + 1);
-    return row0[x] * (1.0 - dy) + row1[x] * dy;
-}
+// Evidence map + bilinear sampler now live in constrained_poly_common.hpp
+// (cpoly::compute_saturated_evidence, cpoly::sample_y). The 5-tap σ=1
+// Gaussian-derivative kernel was tested but blurs the sub-pixel peak
+// (RMS p50 worsens 0.161 → 0.206 on normal); kept as 3-tap central.
 
 // Integrate E along a line from (xa, ya) to (xb, yb), sampled at every
-// integer x between xa and xb. Endpoints get half-weight (trapezoid).
+// integer x between xa and xb.
 double integrate_line(const cv::Mat& E, double xa, double ya,
                       double xb, double yb, int band_lo, int band_hi) {
     int x_lo = std::max(0, (int)std::ceil(xa));
@@ -172,7 +104,7 @@ double integrate_line(const cv::Mat& E, double xa, double ya,
     double sum = 0.0;
     for (int x = x_lo; x <= x_hi; ++x) {
         double y = ya + slope * ((double)x - xa);
-        sum += sample_y(E, x, y, band_lo, band_hi);
+        sum += cpoly::sample_y(E, x, y, band_lo, band_hi);
     }
     return sum;
 }
@@ -186,7 +118,7 @@ std::vector<cv::Point2d> detect_spline_knot_dp(const cv::Mat& gray,
     const double y0 = gt.y0;
 
     // Evidence map + band limits.
-    cv::Mat E = compute_evidence(gray, y0, BAND_HALF_PX);
+    cv::Mat E = cpoly::compute_saturated_evidence(gray, y0, BAND_HALF_PX);
     const int band_lo = std::max(1,     (int)std::round(y0 - BAND_HALF_PX));
     const int band_hi = std::min(H - 2, (int)std::round(y0 + BAND_HALF_PX));
 
@@ -241,31 +173,36 @@ std::vector<cv::Point2d> detect_spline_knot_dp(const cv::Mat& gray,
         }
     }
 
-    // Forward pass over flat arrays. For each (i, b), we collect the
-    // best (a → b → c) triple — but inverting the inner loops to fix
-    // (b, c) and scan a is more cache-friendly because seg[i][b][c]
-    // becomes a single load and dp[i][a][b] is contiguous in a along
-    // a slice of constant b. Also pre-tabulate the curvature penalty
-    // p[a, c] = LAMBDA · (c - 2b + a)² as a function of (a) for fixed
-    // (b, c) — actually faster to inline since the squared term is
-    // cheap and we avoid an extra table.
+    // Forward pass over flat arrays.  Loops restructured with **b
+    // outermost** so each thread owns disjoint dp[i+1][b][·] slices —
+    // safe to parallelise with OpenMP without atomics.  The loop
+    // structure is:
+    //
+    //   for b in [0, M):                       // parallel-friendly
+    //     for a in [b-Δ, b+Δ]:                 // collect candidates
+    //       for c in [b-Δ, b+Δ]:               // emit transitions
+    //         dp[i+1][b][c] = max(..., base + seg[i][b][c] - λ·curv²)
+    //
+    // Per-thread cache footprint:  dp[i][·][b] (1 column),
+    //   seg[i][b][·] (1 row), dp[i+1][b][·] (1 row).  All contiguous
+    //   along the inner index → vectoriser-friendly.
     for (int i = 1; i < K_KNOTS - 1; ++i) {
         const double* dpi   = &dp_flat[(size_t)i * MM];
         const double* segi  = &seg_flat[(size_t)i * MM];
         double*       dpi1  = &dp_flat[(size_t)(i + 1) * MM];
         int16_t*      predi = &pred_flat[(size_t)(i + 1) * MM];
-        for (int a = 0; a < M; ++a) {
-            const double* dpi_a = dpi + (size_t)a * M;
-            int b_lo_outer = std::max(0, a - MAX_DELTA);
-            int b_hi_outer = std::min(M - 1, a + MAX_DELTA);
-            for (int b = b_lo_outer; b <= b_hi_outer; ++b) {
-                double base = dpi_a[b];
+        #pragma omp parallel for schedule(static)
+        for (int b = 0; b < M; ++b) {
+            const double* segi_b = segi + (size_t)b * M;
+            double*       dpi1_b = dpi1 + (size_t)b * M;
+            int16_t*      pred_b = predi + (size_t)b * M;
+            int a_lo = std::max(0, b - MAX_DELTA);
+            int a_hi = std::min(M - 1, b + MAX_DELTA);
+            int c_lo = std::max(0, b - MAX_DELTA);
+            int c_hi = std::min(M - 1, b + MAX_DELTA);
+            for (int a = a_lo; a <= a_hi; ++a) {
+                double base = dpi[(size_t)a * M + b];
                 if (base <= NEG_INF / 2) continue;
-                const double* segi_b = segi + (size_t)b * M;
-                double*       dpi1_b = dpi1 + (size_t)b * M;
-                int16_t*      pred_b = predi + (size_t)b * M;
-                int c_lo = std::max(0, b - MAX_DELTA);
-                int c_hi = std::min(M - 1, b + MAX_DELTA);
                 int two_b_minus_a = 2 * b - a;
                 for (int c = c_lo; c <= c_hi; ++c) {
                     double curv  = (double)(c - two_b_minus_a);
@@ -303,27 +240,45 @@ std::vector<cv::Point2d> detect_spline_knot_dp(const cv::Mat& gray,
         path[i - 2] = pred_at(i, path[i - 1], path[i]);
     }
 
-    // Sub-pixel refinement: parabolic interpolation across y-bins of
-    // the dp value at the recovered triple.
-    auto refine_bin = [](double d_prev, double d_curr, double d_next) {
-        double denom = d_prev - 2.0 * d_curr + d_next;
-        if (std::abs(denom) < 1e-12) return 0.0;
-        double off = 0.5 * (d_prev - d_next) / denom;
-        if (off < -1.0 || off > 1.0) return 0.0;
-        return off;
-    };
+    // Sub-pixel refinement.  Two passes of Gauss-Seidel on the K
+    // knot positions: with neighbours held fixed, sample the
+    // evidence integral at y_path[i] − dy, y_path[i], y_path[i] + dy
+    // (where dy = dy_per_bin), parabolic-interpolate to find the
+    // local maximum, and update y_path[i].  Two sweeps converge to
+    // sub-bin precision because adjacent updates re-couple through
+    // the next knot's neighbour-fixed score.  Replaces the earlier
+    // dp-value-based parabolic interpolation, which conflated
+    // accumulated curvature penalty with local evidence.
     std::vector<double> y_path(K_KNOTS);
-    for (int i = 0; i < K_KNOTS; ++i) {
-        int b = path[i];
-        double off = 0.0;
-        if (i >= 1 && b > 0 && b < M - 1) {
-            int a = path[i - 1];
-            off = refine_bin(dp_at(i, a, b - 1),
-                             dp_at(i, a, b),
-                             dp_at(i, a, b + 1));
+    for (int i = 0; i < K_KNOTS; ++i) y_path[i] = y_of_bin(path[i], y0);
+    const double dy_per_bin = 2.0 * Y_RANGE_PX / (double)(M - 1);
+
+    auto score_at_y = [&](int i, double yi) -> double {
+        double s = 0.0;
+        if (i >= 1) {
+            s += integrate_line(E, xs[i-1], y_path[i-1], xs[i], yi,
+                                band_lo, band_hi);
         }
-        y_path[i] = y_of_bin(b, y0) + off
-                  * (2.0 * Y_RANGE_PX / (double)(M - 1));
+        if (i < K_KNOTS - 1) {
+            s += integrate_line(E, xs[i], yi, xs[i+1], y_path[i+1],
+                                band_lo, band_hi);
+        }
+        return s;
+    };
+    for (int sweep = 0; sweep < 2; ++sweep) {
+        for (int i = 0; i < K_KNOTS; ++i) {
+            double yc = y_path[i];
+            double sm = score_at_y(i, yc - dy_per_bin);
+            double s0 = score_at_y(i, yc);
+            double sp = score_at_y(i, yc + dy_per_bin);
+            double denom = sm - 2.0 * s0 + sp;
+            if (std::abs(denom) > 1e-12) {
+                double off = 0.5 * (sm - sp) / denom;
+                if (off > -1.0 && off < 1.0) {
+                    y_path[i] = yc + off * dy_per_bin;
+                }
+            }
+        }
     }
 
     // Emit dense output: linear interpolation between adjacent knots.
