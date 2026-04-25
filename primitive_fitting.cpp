@@ -37,6 +37,7 @@
 #include <mutex>
 #include <random>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace {
@@ -218,6 +219,11 @@ struct FitResult {
     double stability          = 0.0;
     double residual_median_px = 0.0;
     double confidence         = 0.0;
+    // Fraction of unique calipers (not raw hits) that contributed an
+    // inlier. Used in `confidence` instead of inlier_ratio so the metric
+    // stays well-behaved when top_n_per_caliper > 1 inflates total_hits
+    // without changing the underlying coverage.
+    double caliper_coverage   = 0.0;
 
     bool   ok = false;
     bool   pass = false;
@@ -349,6 +355,7 @@ public:
         out.set("confidence",         r.confidence);
         out.set("stability",          r.stability);
         out.set("residual_median_px", r.residual_median_px);
+        out.set("caliper_coverage",   r.caliper_coverage);
         if (r.ok && r.model == FitModel::Line) {
             out.set("x1", r.p1.x).set("y1", r.p1.y);
             out.set("x2", r.p2.x).set("y2", r.p2.y);
@@ -707,8 +714,12 @@ private:
         return pairs > 0 ? sum / pairs : 0.0;
     }
 
-    // Compute median, confidence from residuals + stability + inlier_ratio.
+    // Compute residual median + unique-caliper coverage, then combine
+    // into the 0–1 confidence score. The coverage term uses CaliperHit::t
+    // (== caliper_index / (N-1)) to count distinct calipers, which is
+    // robust to top_n_per_caliper > 1 inflating the raw hit count.
     static void finalize_confidence(FitResult& r, double stability,
+                                    const std::vector<int>& inlier_indices,
                                     const std::vector<double>& residuals_abs,
                                     double thr_px) {
         double med = 0.0;
@@ -717,10 +728,20 @@ private:
             std::nth_element(rs.begin(), rs.begin() + rs.size()/2, rs.end());
             med = rs[rs.size()/2];
         }
+        // Map t to an integer caliper id (t = i/(N-1) with N up to ~10⁴
+        // → 1e6 quantisation is well clear of collision).
+        auto key = [](double t) { return (int64_t)std::llround(t * 1e6); };
+        std::unordered_set<int64_t> all_cal, in_cal;
+        for (const auto& h : r.hits) all_cal.insert(key(h.t));
+        for (int idx : inlier_indices) in_cal.insert(key(r.hits[idx].t));
+        double cov = all_cal.empty() ? 0.0
+            : (double)in_cal.size() / (double)all_cal.size();
+
         r.stability          = stability;
         r.residual_median_px = med;
+        r.caliper_coverage   = cov;
         double tightness     = std::clamp(1.0 - med / std::max(thr_px, 1e-6), 0.0, 1.0);
-        r.confidence         = std::clamp(stability * tightness * r.inlier_ratio, 0.0, 1.0);
+        r.confidence         = std::clamp(stability * tightness * cov, 0.0, 1.0);
     }
 
     // --- Line fit (RANSAC + LSQ) -----------------------------------------
@@ -792,7 +813,7 @@ private:
             res.push_back(std::abs(nx * r.hits[idx].pos.x +
                                    ny * r.hits[idx].pos.y + c_off));
         }
-        finalize_confidence(r, stab, res, thr);
+        finalize_confidence(r, stab, best_in, res, thr);
         r.ok = true;
         return true;
     }
@@ -905,7 +926,7 @@ private:
             res.push_back(std::abs(std::hypot(r.hits[idx].pos.x - cx,
                                               r.hits[idx].pos.y - cy) - rr));
         }
-        finalize_confidence(r, stab, res, thr);
+        finalize_confidence(r, stab, best_in, res, thr);
         r.ok = true;
         return true;
     }
@@ -1006,7 +1027,7 @@ private:
                 res.push_back(point_ellipse_distance(
                     r.hits[idx].pos.x, r.hits[idx].pos.y, cx, cy, a, b, rot_rad));
             }
-            finalize_confidence(r, stab, res, thr);
+            finalize_confidence(r, stab, best_in, res, thr);
         }
         r.ok = true;
         return true;
@@ -1177,7 +1198,7 @@ private:
             for (int idx : best_in) {
                 res.push_back(std::abs(vs[idx] - eval(final_coeffs, us[idx])));
             }
-            finalize_confidence(r, stab, res, thr);
+            finalize_confidence(r, stab, best_in, res, thr);
         }
         r.ok = true;
         return true;
@@ -1661,6 +1682,7 @@ private:
             root.set("confidence",         last_result_.confidence);
             root.set("stability",          last_result_.stability);
             root.set("residual_median_px", last_result_.residual_median_px);
+            root.set("caliper_coverage",   last_result_.caliper_coverage);
             if (last_result_.model == FitModel::Line) {
                 root.set("x1", last_result_.p1.x).set("y1", last_result_.p1.y);
                 root.set("x2", last_result_.p2.x).set("y2", last_result_.p2.y);

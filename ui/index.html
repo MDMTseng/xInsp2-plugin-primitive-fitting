@@ -50,6 +50,7 @@
         <span class="k">confidence</span><span class="v" id="m-conf">—</span>
         <span class="k">stability</span><span class="v" id="m-stab">—</span>
         <span class="k">residual med</span><span class="v" id="m-resmed">—</span>
+        <span class="k">caliper cov</span><span class="v" id="m-cov">—</span>
     </div>
 
     <h3>Search Region</h3>
@@ -460,6 +461,7 @@
             document.getElementById('m-conf').textContent   = ((s.confidence ?? 0) * 100).toFixed(0) + '%';
             document.getElementById('m-stab').textContent   = ((s.stability  ?? 0) * 100).toFixed(0) + '%';
             document.getElementById('m-resmed').textContent = (s.residual_median_px ?? 0).toFixed(2) + ' px';
+            document.getElementById('m-cov').textContent    = ((s.caliper_coverage ?? 0) * 100).toFixed(0) + '%';
         } else {
             verdict.className = 'badge idle';
             verdict.textContent = 'IDLE';
@@ -468,7 +470,7 @@
                 document.getElementById('m-in').textContent = document.getElementById('m-ratio').textContent = '—';
             document.getElementById('m-poly').textContent = document.getElementById('m-sigma').textContent = '—';
             document.getElementById('m-conf').textContent = document.getElementById('m-stab').textContent =
-                document.getElementById('m-resmed').textContent = '—';
+                document.getElementById('m-resmed').textContent = document.getElementById('m-cov').textContent = '—';
         }
         const key = `${s.found ? 1 : 0}:${s.pass ? 1 : 0}:${s.inlier_count ?? 0}:${(s.length ?? 0).toFixed(2)}`;
         if (key !== lastResultKey) {

@@ -919,6 +919,104 @@ XI_TEST(confidence_degrades_with_gaussian_noise) {
     g_syms.destroy(inst);
 }
 
+// On a hard stripe scene (σ=15, 40 false stripes), sweep four knob
+// configurations to expose which lever actually moves confidence:
+//   A. baseline        — top_n=1, poly off, iters=200  (current default)
+//   B. wider candidate  — top_n=3
+//   C. + residual filter — top_n=3, poly degree=1 on
+//   D. + more RANSAC    — same as C, iters=500
+// Predicted ordering: A << B < C ≈ D (more iters does not help when the
+// inlier pool is already polluted at the per-caliper peak-pick stage).
+XI_TEST(stripe_scene_knob_sweep) {
+    load_dll();
+    void* inst = g_syms.create(&g_host, "t_knob");
+    const int W = 320, H = 240, EDGE_Y = 120;
+    const double SIGMA   = 15.0;
+    const int    STRIPES = 40;
+
+    char rsp[4096];
+    g_syms.exchange(inst,
+        R"({"command":"set_region","mode":"line",)"
+        R"("p1x":30,"p1y":120,"p2x":290,"p2y":120})",
+        rsp, sizeof(rsp));
+
+    struct Knob { const char* tag; const char* config; };
+    const Knob knobs[] = {
+        {"A baseline (top_n=1)",
+         R"({"command":"set_config","fit_model":"line","polarity":"dark_to_bright",)"
+         R"("num_calipers":20,"caliper_width":3,"caliper_span":80,)"
+         R"("min_edge_strength":8,"top_n_per_caliper":1,)"
+         R"("ransac_threshold_px":1.5,"ransac_iterations":200,)"
+         R"("expected_outlier_rate":0.5,)"
+         R"("poly_enabled":false,)"
+         R"("min_length_px":0,"min_inlier_ratio":0})"},
+        {"B top_n=3        ",
+         R"({"command":"set_config","fit_model":"line","polarity":"dark_to_bright",)"
+         R"("num_calipers":20,"caliper_width":3,"caliper_span":80,)"
+         R"("min_edge_strength":8,"top_n_per_caliper":3,)"
+         R"("edge_min_separation_px":3,)"
+         R"("ransac_threshold_px":1.5,"ransac_iterations":200,)"
+         R"("expected_outlier_rate":0.5,)"
+         R"("poly_enabled":false,)"
+         R"("min_length_px":0,"min_inlier_ratio":0})"},
+        {"C top_n=3 + poly1 ",
+         R"({"command":"set_config","fit_model":"line","polarity":"dark_to_bright",)"
+         R"("num_calipers":20,"caliper_width":3,"caliper_span":80,)"
+         R"("min_edge_strength":8,"top_n_per_caliper":3,)"
+         R"("edge_min_separation_px":3,)"
+         R"("ransac_threshold_px":1.5,"ransac_iterations":200,)"
+         R"("expected_outlier_rate":0.5,)"
+         R"("poly_enabled":true,"poly_degree":1,"poly_reject_sigma":2.5,)"
+         R"("min_length_px":0,"min_inlier_ratio":0})"},
+        {"D + iters=500    ",
+         R"({"command":"set_config","fit_model":"line","polarity":"dark_to_bright",)"
+         R"("num_calipers":20,"caliper_width":3,"caliper_span":80,)"
+         R"("min_edge_strength":8,"top_n_per_caliper":3,)"
+         R"("edge_min_separation_px":3,)"
+         R"("ransac_threshold_px":1.5,"ransac_iterations":500,)"
+         R"("expected_outlier_rate":0.5,)"
+         R"("poly_enabled":true,"poly_degree":1,"poly_reject_sigma":2.5,)"
+         R"("min_length_px":0,"min_inlier_ratio":0})"},
+    };
+
+    std::fprintf(stderr,
+        "  knob sweep on σ=%.0f, stripes=%d:\n", SIGMA, STRIPES);
+    double conf_A = -1, conf_B = -1, conf_C = -1, conf_D = -1;
+    for (const auto& k : knobs) {
+        g_syms.exchange(inst, k.config, rsp, sizeof(rsp));
+        xi_image_handle scene = make_horizontal_edge_noisy(W, H, EDGE_Y,
+                                                           SIGMA, STRIPES);
+        xi_record_image imgs[] = {{"src", scene}};
+        xi_record in; in.images = imgs; in.image_count = 1; in.json = "{}";
+        xi_record_out out; xi_record_out_init(&out);
+        g_syms.process(inst, &in, &out);
+        std::string result = out.json ? out.json : "";
+
+        double conf   = json_num(result, "confidence");
+        double stab   = json_num(result, "stability");
+        double resmed = json_num(result, "residual_median_px");
+        int    inl    = json_int(result, "inlier_count");
+        int    total  = json_int(result, "total_hits");
+        std::fprintf(stderr,
+            "    %s  inliers=%d/%-3d  conf=%.3f  stab=%.3f  res_med=%.3f px\n",
+            k.tag, inl, total, conf, stab, resmed);
+
+        if      (conf_A < 0) conf_A = conf;
+        else if (conf_B < 0) conf_B = conf;
+        else if (conf_C < 0) conf_C = conf;
+        else                 conf_D = conf;
+
+        release_out_images(out);
+        xi_record_out_free(&out);
+        g_host.image_release(scene);
+    }
+    // Expected: top_n=3 must improve over baseline; iters=500 must not
+    // significantly improve over iters=200 (within 0.05).
+    XI_EXPECT(conf_B > conf_A);
+    XI_EXPECT(std::abs(conf_D - conf_C) < 0.10);
+    g_syms.destroy(inst);
+}
+
 int main() {
     auto results = xi::test::run_all();
     for (auto& r : results) if (!r.passed) return 1;
