@@ -14,7 +14,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import ConcatDataset, DataLoader, random_split
 
 from dataset import CaliperDataset
 from model import CaliperEdgeNet, soft_argmax
@@ -22,7 +22,8 @@ from model import CaliperEdgeNet, soft_argmax
 
 def parse_args():
     ap = argparse.ArgumentParser()
-    ap.add_argument("dataset", type=str)
+    ap.add_argument("dataset", type=str, nargs="+",
+                    help="one or more *.bin dataset files; concatenated")
     ap.add_argument("--out", type=str, default="caliper_edge.pt")
     ap.add_argument("--epochs", type=int, default=50)
     ap.add_argument("--bs", type=int, default=256)
@@ -39,8 +40,20 @@ def parse_args():
 def main():
     args = parse_args()
     print(f"device: {args.device}")
-    ds = CaliperDataset(args.dataset)
-    print(f"loaded {len(ds)} records, ROI = {ds.W}×{ds.H}")
+    parts = [CaliperDataset(p) for p in args.dataset]
+    if len(parts) == 1:
+        ds = parts[0]
+    else:
+        # All sub-datasets must share W/H so model output dim is constant.
+        for p in parts[1:]:
+            if (p.W, p.H) != (parts[0].W, parts[0].H):
+                raise ValueError(f"dataset shape mismatch: {p.W}x{p.H} vs {parts[0].W}x{parts[0].H}")
+        ds = ConcatDataset(parts)
+        # Expose .W/.H for downstream prints.
+        ds.W, ds.H = parts[0].W, parts[0].H
+    sizes = [len(p) for p in parts]
+    print(f"loaded {len(ds)} records ({' + '.join(map(str, sizes))}), "
+          f"ROI = {ds.W}x{ds.H}")
 
     n_val = int(len(ds) * args.val_frac)
     n_train = len(ds) - n_val
