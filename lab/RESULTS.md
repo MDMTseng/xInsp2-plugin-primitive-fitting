@@ -22,6 +22,89 @@ No algorithm overfits to any specific scene — parameters are either principled
 
 (Outlier scenes = fraction of scenes where the algorithm emitted ≥ 5 points that are > 10 px from ground truth.)
 
+## Photometric augmentation (`--photo`)
+
+Beyond Gaussian + salt-pepper pixel noise and the spike/stripe
+distractors, real-world images carry slow illumination variation:
+non-uniform lighting, vignetting from optics, brightness gradients,
+spatial gain (the grayscale equivalent of colour tint).
+`scene.cpp::apply_photometric()` applies four such effects in
+combination — strength sampled per scene, direction/centre/sigma
+randomised — and the new `--photo` flag at the lab/dump-tool CLI
+level activates a NoiseLevel::Photo distribution that pairs this
+augmentation with normal-mode pixel noise.
+
+The four effects:
+1. Linear additive gradient at random direction θ.
+2. Radial vignette (multiplicative darken at corners).
+3. Gaussian illumination blob (random centre, σ, sign).
+4. Low-frequency multiplicative gain (grayscale tint analog).
+
+### Photo-mode benchmark (100 seeds, with v3 caliper_cnn)
+
+| Algorithm | RMS p50 | RMS p90 | Coverage | Outlier | ms p50 |
+|---|---:|---:|---:|---:|---:|
+| `spline_knot_dp` | **0.124** | **0.268** | **99.3%** | 3.0% | 7.1 |
+| `caliper_cnn` (v3) | 0.278 | 0.407 | 98.7% | **2.0%** | 0.99 |
+| `caliper_ransac` | 0.224 | 0.878 | 95.3% | 6.0% | 0.45 |
+| `dijkstra_path` | 0.315 | 0.518 | 96.0% | 3.0% | 0.37 |
+| `tensor_voting` | 0.233 | 0.481 | 74.7% | 91.0% | 15.2 |
+
+Two observations:
+
+1. **`spline_knot_dp` barely notices photometric variation.** Its
+   saturating evidence with `κ = 0.20·percentile_90(E)` tracks
+   *typical* strong evidence rather than absolute level — when
+   illumination shifts the whole image up or down, the gradient
+   distribution shifts proportionally and κ scales with it. The
+   normalised evidence `E/(E+κ)` is therefore largely
+   illumination-invariant by construction.
+
+2. **`caliper_cnn` after retraining on photo data hits 2% outlier**
+   (vs 6% for the closest non-DP competitor). The CNN learnt to
+   ignore smooth illumination gradients in favour of sharp
+   y-direction edges — a property that's harder to encode in a
+   hand-crafted filter without also rejecting weak edges.
+
+## Trained-CNN (`algo_caliper_cnn.cpp`) v3 — multi-noise
+
+The v1 model was trained only on normal-noise scenes; v2 added harsh;
+v3 also adds photo. 60 epochs over the union (207 K records) keeps
+each scene visible to the optimiser as many times as v1's normal-only
+30-epoch run.
+
+### v3 numbers (100 seeds × 3 noise regimes)
+
+| Regime | Algorithm | RMS p50 | RMS p90 | Coverage | Outlier | ms p50 |
+|---|---|---:|---:|---:|---:|---:|
+| normal | `caliper_cnn` (v3) | 0.274 | 0.407 | 99.2% | **1.0%** | 0.89 |
+|        | `spline_knot_dp`   | 0.118 | 0.259 | 99.3% |  3.0%  | 4.0 |
+|        | `caliper_ransac`   | 0.200 | 0.784 | 96.0% |  4.0%  | 0.33 |
+|        | `dijkstra_path`    | 0.310 | 0.498 | 96.3% |  3.0%  | 0.28 |
+| harsh  | `caliper_cnn` (v3) | 0.371 | 0.613 | **97.4%** | **3.0%** | 1.06 |
+|        | `spline_knot_dp`   | 0.197 | 0.475 | 94.0% |  7.0%  | 5.1 |
+|        | `dijkstra_path`    | 0.521 | 0.741 | 62.5% | 47.0%  | 0.34 |
+| photo  | `caliper_cnn` (v3) | 0.278 | 0.407 | 98.7% | **2.0%** | 0.99 |
+|        | `spline_knot_dp`   | 0.124 | 0.268 | 99.3% |  3.0%  | 7.1 |
+|        | `caliper_ransac`   | 0.224 | 0.878 | 95.3% |  6.0%  | 0.45 |
+|        | `dijkstra_path`    | 0.315 | 0.518 | 96.0% |  3.0%  | 0.37 |
+
+`caliper_cnn` (v3) is the **only lab algorithm with outlier rate
+≤ 3% in all three noise regimes**. RMS p50 trails `spline_knot_dp`
+by ~0.15 px on the cleanest scenes — the dense knot-DP retains the
+sub-pixel-precision crown — but caliper_cnn covers the
+speed/robustness Pareto frontier at ~5× the throughput.
+
+Reproducing v3:
+```sh
+./build/Release/dump_caliper_dataset.exe lab/cnn/data/normal.bin --scenes 5000
+./build/Release/dump_caliper_dataset.exe lab/cnn/data/harsh.bin  --scenes 3000 --harsh
+./build/Release/dump_caliper_dataset.exe lab/cnn/data/photo.bin  --scenes 5000 --photo
+cd lab/cnn
+python train.py data/normal.bin data/harsh.bin data/photo.bin --epochs 60
+python export_onnx.py caliper_edge.pt --out caliper_edge.onnx
+```
+
 ## Globally-optimal knot DP (`algo_spline_knot_dp.cpp`)
 
 The closest practical relative of "find the polynomial maximizing
