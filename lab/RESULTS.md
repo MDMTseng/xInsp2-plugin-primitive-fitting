@@ -66,6 +66,85 @@ Two observations:
    y-direction edges — a property that's harder to encode in a
    hand-crafted filter without also rejecting weak edges.
 
+## Trained-CNN v4 — wide-context input (CAL_W = 15)
+
+The biggest single quality jump in the CNN line of work. Per-caliper
+input shape goes from 3×80 to **15×80** — each caliper sees ±7 px of
+horizontal context instead of ±1. This matters because the lab's
+false stripes span up to 30 % of W (96 px); with a 3-px window the
+network only ever sees the *interior* of a stripe (indistinguishable
+from a real edge), but with a 15-px window it routinely catches
+stripe edges (sharp transitions at *both* y = top *and* y = bottom)
+which are visually distinct from the true curve (sharp y-transition
+with extended dark→bright region).
+
+Architecture unchanged otherwise (1-D CNN, 3 conv stages, 11 K
+parameters — only ~1 K more than CAL_W = 3). Training data is the
+same (normal + harsh + photo, 207 K records); the model trained for
+~12 minutes (auto early-stop after ~42 epochs with 10-epoch
+patience), val_y_L1 dropped to **0.156 px** (vs v3's 0.350 px —
+2.2× tighter sub-pixel localisation).
+
+### Numbers (100 seeds × 3 noise regimes)
+
+| Regime | Algorithm | RMS p50 | RMS p90 | Coverage | Outlier | ms p50 |
+|---|---|---:|---:|---:|---:|---:|
+| normal | `caliper_cnn` (v4) | 0.224 | 0.390 | **99.6%** | **0.0%** | 0.92 |
+|        | `spline_knot_dp`   | 0.118 | 0.259 | 99.3% | 3.0% | 4.0 |
+|        | `caliper_ransac`   | 0.200 | 0.784 | 96.0% | 4.0% | 0.33 |
+|        | `dijkstra_path`    | 0.310 | 0.498 | 96.3% | 3.0% | 0.30 |
+| harsh  | `caliper_cnn` (v4) | 0.304 | 0.524 | **98.7%** | **1.0%** | 1.18 |
+|        | `spline_knot_dp`   | 0.163 | 0.438 | 93.2% | 8.0% | 4.8 |
+|        | `dijkstra_path`    | 0.499 | 0.814 | 62.4% | 48.0% | 0.39 |
+| photo  | `caliper_cnn` (v4) | 0.227 | 0.342 | **99.6%** | **0.0%** | 1.00 |
+|        | `spline_knot_dp`   | 0.124 | 0.268 | 99.3% | 3.0% | 5.4 |
+|        | `caliper_ransac`   | 0.224 | 0.878 | 95.3% | 6.0% | 0.44 |
+
+**`caliper_cnn` v4 is the first lab algorithm to reach 0.0%
+outlier-scene rate on both normal and photo, and ≤ 1.0% in all
+three regimes.** Coverage ≥ 98.7% across the board.
+
+The remaining sub-pixel-precision gap to `spline_knot_dp` (0.224 vs
+0.118 RMS p50 on normal) is the dense-DP advantage: spline_knot_dp
+runs an exhaustive K=20 × M=160 Viterbi over saturated evidence
+that CNN inference does not match. For applications where bounded
+worst-case error matters more than the lowest mean, v4 is now the
+strict winner; for the lowest absolute RMS, spline_knot_dp's 4 ms
+DP is still in the lead.
+
+### What wide-context buys
+
+A 15-column window per caliper is just barely wide enough to span
+half of the smallest false stripe (32 px) and roughly 16 % of the
+widest (96 px). The network exploits this in two ways the original
+3-column model could not:
+
+1. **Stripe top/bottom co-detection.** A real curve has a single
+   sharp y-transition (dark→bright). A stripe has two transitions
+   2–3 px apart (top dark→bright, bottom bright→dark). With the
+   15-col view the network sees both transitions as a *paired*
+   pattern and learns to suppress the corresponding peaks.
+
+2. **Spatial coherence within the caliper.** A spike block 5–8 px
+   wide produces evidence in only ~half the caliper window's
+   columns; a real curve fills all 15. The network can use this
+   density signal as a discriminator the 3-col model never saw.
+
+### Reproducing v4
+
+```sh
+# Wide-context dataset dump (CAL_W = 15)
+./build/Release/dump_caliper_dataset.exe lab/cnn/data/normal15.bin --scenes 5000
+./build/Release/dump_caliper_dataset.exe lab/cnn/data/harsh15.bin  --scenes 3000 --harsh
+./build/Release/dump_caliper_dataset.exe lab/cnn/data/photo15.bin  --scenes 5000 --photo
+
+cd lab/cnn
+python train.py data/normal15.bin data/harsh15.bin data/photo15.bin \
+    --epochs 60 --bs 256 --patience 10 --out caliper_edge_v4.pt
+python plot_metrics.py caliper_edge_v4.pt.metrics.csv   # health check
+python export_onnx.py caliper_edge_v4.pt --out caliper_edge_v4.onnx
+```
+
 ## Trained-CNN (`algo_caliper_cnn.cpp`) v3 — multi-noise
 
 The v1 model was trained only on normal-noise scenes; v2 added harsh;
