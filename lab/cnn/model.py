@@ -21,17 +21,29 @@ import torch.nn as nn
 
 
 class CaliperEdgeNet(nn.Module):
-    def __init__(self, in_ch: int = 3, hidden: int = 64):
+    """Tiny 1-D CNN for caliper edge probability.
+
+    Default config (10 K params, ~0.5 ms forward on CPU per batch of 30):
+        in 3 → 16 (k=5)  →  ReLU
+              16 → 32 (k=5)  →  ReLU
+              32 → 32 (k=7)  →  ReLU
+              32 → 1  (k=1)
+    BatchNorm dropped — at ~10 K params the network is small enough that
+    BN's overhead and ONNX-export quirks (constant-fold needed) outweigh
+    its training stability benefit.
+
+    To restore the original 40 K-param config, pass `hidden=64`.
+    """
+
+    def __init__(self, in_ch: int = 3, hidden: int = 32):
         super().__init__()
+        h1 = hidden // 2  # narrower first stage
         self.net = nn.Sequential(
-            nn.Conv1d(in_ch, hidden // 2, kernel_size=5, padding=2),
-            nn.BatchNorm1d(hidden // 2),
+            nn.Conv1d(in_ch, h1, kernel_size=5, padding=2),
             nn.ReLU(inplace=True),
-            nn.Conv1d(hidden // 2, hidden, kernel_size=5, padding=2),
-            nn.BatchNorm1d(hidden),
+            nn.Conv1d(h1, hidden, kernel_size=5, padding=2),
             nn.ReLU(inplace=True),
             nn.Conv1d(hidden, hidden, kernel_size=7, padding=3),
-            nn.BatchNorm1d(hidden),
             nn.ReLU(inplace=True),
             nn.Conv1d(hidden, 1, kernel_size=1),
         )

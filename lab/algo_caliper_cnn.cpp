@@ -39,7 +39,7 @@ namespace {
 
 constexpr int CAL_W      = 3;     // matches dump_caliper_dataset.cpp
 constexpr int CAL_H      = 80;
-constexpr int N_CAL      = 30;    // calipers per image
+constexpr int N_CAL      = 16;    // calipers per image
 constexpr int TOP_K_NMS  = 3;     // peaks kept per caliper
 constexpr int MIN_SEP_Y  = 4;     // NMS separation in y (pixels)
 constexpr double PROB_THR = 0.30; // peaks below this are ignored
