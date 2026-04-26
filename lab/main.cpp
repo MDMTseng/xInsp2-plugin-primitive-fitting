@@ -54,6 +54,7 @@ int main(int argc, char** argv) {
     bool dashed = false;
     bool bumpy  = false;
     double blend_alpha = 0.0;
+    std::string only_filter;
     fs::path out_dir = fs::path(argv[0]).parent_path() / "results";
 
     for (int i = 1; i < argc; ++i) {
@@ -73,10 +74,21 @@ int main(int argc, char** argv) {
             dashed = true;
         } else if (!std::strcmp(argv[i], "--bumpy")) {
             bumpy = true;
-        } else if (!std::strcmp(argv[i], "--blend") && i + 1 < argc) {
-            blend_alpha = std::atof(argv[++i]);
         } else if (!std::strcmp(argv[i], "--blend")) {
-            blend_alpha = 0.2;   // default blend strength
+            // Optional alpha argument; only consume next token if it
+            // is a numeric literal (otherwise it's the next flag).
+            if (i + 1 < argc) {
+                const char* nxt = argv[i + 1];
+                bool is_num = (nxt[0] == '.' || (nxt[0] >= '0' && nxt[0] <= '9') ||
+                               (nxt[0] == '-' && (nxt[1] == '.' ||
+                                                  (nxt[1] >= '0' && nxt[1] <= '9'))));
+                if (is_num) { blend_alpha = std::atof(argv[++i]); }
+                else        { blend_alpha = 0.2; }
+            } else {
+                blend_alpha = 0.2;
+            }
+        } else if (!std::strcmp(argv[i], "--only") && i + 1 < argc) {
+            only_filter = argv[++i];
         }
     }
     const char* level_name = (level == lab::NoiseLevel::Harsh) ? " (harsh)"
@@ -88,7 +100,7 @@ int main(int argc, char** argv) {
     fs::create_directories(out_dir / "samples");
 
     struct Case { const char* name; lab::Algo fn; };
-    const std::vector<Case> cases = {
+    std::vector<Case> cases = {
         {"naive_threshold",  lab::detect_naive},
         {"dp_scanline",      lab::detect_dp},
         {"dijkstra_path",    lab::detect_dijkstra},
@@ -114,6 +126,15 @@ int main(int argc, char** argv) {
         {"caliper_cnn_prosac",  lab::detect_caliper_cnn_cross_ort_prosac},
         {"caliper_cnn_spline",  lab::detect_caliper_cnn_cross_ort_spline},
     };
+    // Apply --only NAME filter (substring match against case name).
+    if (!only_filter.empty()) {
+        std::vector<Case> filtered;
+        for (const auto& c : cases) {
+            if (std::string(c.name).find(only_filter) != std::string::npos)
+                filtered.push_back(c);
+        }
+        cases = std::move(filtered);
+    }
     std::vector<Agg> aggs(cases.size());
     for (size_t i = 0; i < cases.size(); ++i) aggs[i].name = cases[i].name;
 
@@ -145,7 +166,22 @@ int main(int argc, char** argv) {
             aggs[i].outlier_scenes  .push_back(ev.outlier_count >= 5 ? 1 : 0);
             aggs[i].no_detect_scenes.push_back(ev.total_points == 0 ? 1 : 0);
 
-            if (std::find(sample_seeds.begin(), sample_seeds.end(), s) != sample_seeds.end()) {
+            // Save overlay if (a) seed is in the fixed sample list, OR
+            // (b) it's caliper_cnn_prosac and the scene is a failure
+            // (≥5 outlier points). This auto-captures every failure case
+            // for the production-leaning algorithm so the overlay set
+            // contains a mix of clean wins + diagnostic fails.
+            bool is_sample = std::find(sample_seeds.begin(), sample_seeds.end(), s)
+                             != sample_seeds.end();
+            bool is_prosac_fail = (std::strcmp(cases[i].name, "caliper_cnn_prosac") == 0)
+                                  && ev.outlier_count >= 5;
+            if (is_prosac_fail && !is_sample) {
+                // Also save raw if this is a brand-new failure seed.
+                char raw_name[64];
+                std::snprintf(raw_name, sizeof(raw_name), "seed%03d_raw.png", s);
+                cv::imwrite((out_dir / "samples" / raw_name).string(), rs.image);
+            }
+            if (is_sample || is_prosac_fail) {
                 char name[256];
                 std::snprintf(name, sizeof(name), "seed%03d_%s_overlay.png",
                               s, cases[i].name);
