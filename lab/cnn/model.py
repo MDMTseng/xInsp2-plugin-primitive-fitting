@@ -79,7 +79,8 @@ class CrossCaliperEdgeNet(nn.Module):
     x_flat.shape = [K, in_ch, H] (single image, no scene-batch dim).
     """
 
-    def __init__(self, in_ch: int = 15, hidden: int = 32):
+    def __init__(self, in_ch: int = 15, hidden: int = 24,
+                 cross_ky: int = 5):
         super().__init__()
         h1 = hidden // 2
         # Stage 1: per-caliper local feature extractor (1-D in y).
@@ -90,11 +91,14 @@ class CrossCaliperEdgeNet(nn.Module):
             nn.ReLU(inplace=True),
         )
         # Stage 2: cross-caliper 2-D mix (caliper × y).
-        # Kernel (3 across calipers) × (7 in y).
+        # Default kernel (3 across calipers) × (5 in y) — was (3, 7) in
+        # v5 but the wider y kernel adds 40 % params for marginal RF
+        # gain (local Conv1d already supplies y context).
+        py = cross_ky // 2
         self.cross = nn.Sequential(
-            nn.Conv2d(hidden, hidden, kernel_size=(3, 7), padding=(1, 3)),
+            nn.Conv2d(hidden, hidden, kernel_size=(3, cross_ky), padding=(1, py)),
             nn.ReLU(inplace=True),
-            nn.Conv2d(hidden, hidden, kernel_size=(3, 7), padding=(1, 3)),
+            nn.Conv2d(hidden, hidden, kernel_size=(3, cross_ky), padding=(1, py)),
             nn.ReLU(inplace=True),
         )
         # Stage 3: per-caliper 1×1 logit head.
