@@ -49,5 +49,7 @@ lab/results/
 lab/cnn/data/
 lab/cnn/*.pt
 lab/cnn/*.onnx
+lab/cnn/*.log
+lab/cnn/.venv/
 __pycache__/
 *.pyc
