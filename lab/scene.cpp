@@ -225,7 +225,8 @@ cv::Mat make_weak_curve_with_spikes(const GroundTruth& gt_in) {
 // ---- Randomised scene --------------------------------------------------
 
 RandomScene make_random_scene(int seed, NoiseLevel level, bool dashed_edge,
-                              bool bumpy_edge) {
+                              bool bumpy_edge,
+                              double blend_alpha, int blend_partner_offset) {
     const bool harsh = (level == NoiseLevel::Harsh);
     const bool low   = (level == NoiseLevel::Low);
     const bool none  = (level == NoiseLevel::None);
@@ -414,6 +415,30 @@ RandomScene make_random_scene(int seed, NoiseLevel level, bool dashed_edge,
                          :         uni_d(0.0, 0.012);
     add_noise(img, rng, gsigma, sp);
     gt.gaussian_sigma = gsigma;
+
+    // Optional cross-scene alpha blend: pair with an unrelated scene's
+    // image and mix in `blend_alpha` × image_B. Tests robustness to
+    // composite distractors whose curve / spike / stripe pattern is
+    // completely uncorrelated with image_A's. Recursively calls
+    // make_random_scene with blend_alpha=0 to avoid infinite recursion.
+    if (blend_alpha > 0.0) {
+        int partner_seed = seed + blend_partner_offset;
+        if (partner_seed == seed) partner_seed = seed ^ 0x5A5A5A5A;
+        auto partner = make_random_scene(partner_seed, level,
+                                         dashed_edge, bumpy_edge,
+                                         /*blend_alpha=*/0.0,
+                                         blend_partner_offset);
+        const double a = std::clamp(blend_alpha, 0.0, 1.0);
+        const double b = 1.0 - a;
+        for (int y = 0; y < H; ++y) {
+            uint8_t*       row_a = img.ptr<uint8_t>(y);
+            const uint8_t* row_b = partner.image.ptr<uint8_t>(y);
+            for (int x = 0; x < W; ++x) {
+                double v = b * (double)row_a[x] + a * (double)row_b[x];
+                row_a[x] = (uint8_t)std::clamp(v, 0.0, 255.0);
+            }
+        }
+    }
 
     return { img, gt };
 }

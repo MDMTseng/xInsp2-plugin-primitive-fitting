@@ -96,6 +96,8 @@ int main(int argc, char** argv) {
     int seeds = 5000;
     int K_per_scene = 16;
     bool scene_records = false;
+    double blend_prob  = 0.0;        // 0 = no blend; 1.0 = always blend
+    double blend_alpha = 0.2;        // alpha for blended scenes
     lab::NoiseLevel level = lab::NoiseLevel::Normal;
     for (int i = 2; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--scenes") && i + 1 < argc) {
@@ -107,7 +109,22 @@ int main(int argc, char** argv) {
         else if  (!std::strcmp(argv[i], "--low-noise")) level = lab::NoiseLevel::Low;
         else if  (!std::strcmp(argv[i], "--no-noise"))  level = lab::NoiseLevel::None;
         else if  (!std::strcmp(argv[i], "--photo"))     level = lab::NoiseLevel::Photo;
+        else if  (!std::strcmp(argv[i], "--blend-prob") && i + 1 < argc) {
+            blend_prob = std::atof(argv[++i]);
+        } else if (!std::strcmp(argv[i], "--blend-alpha") && i + 1 < argc) {
+            blend_alpha = std::atof(argv[++i]);
+        } else if (!std::strcmp(argv[i], "--blend")) {
+            blend_prob = 1.0;       // shorthand: blend every scene
+        }
     }
+    std::mt19937 aug_rng(0xB1E5DBABu);   // separate RNG so the
+    // per-scene blend toggle is reproducible across runs.
+    auto blend_for_seed = [&](int s) -> double {
+        if (blend_prob <= 0.0) return 0.0;
+        std::uniform_real_distribution<double> u(0.0, 1.0);
+        std::mt19937 r((uint32_t)(s * 0xDEADBEEFu) ^ aug_rng());
+        return (u(r) < blend_prob) ? blend_alpha : 0.0;
+    };
 
     fs::create_directories(out_path.parent_path());
     std::ofstream f(out_path, std::ios::binary);
@@ -132,7 +149,8 @@ int main(int argc, char** argv) {
         uint32_t n_written = 0;
         std::vector<uint8_t> roi;
         for (int s = 0; s < seeds; ++s) {
-            auto rs = lab::make_random_scene(s, level, false, false);
+            auto rs = lab::make_random_scene(s, level, false, false,
+                                             blend_for_seed(s));
             const int W = rs.image.cols;
             // Emit K calipers for this scene back-to-back.
             for (int k = 0; k < K_per_scene; ++k) {
@@ -171,7 +189,8 @@ int main(int argc, char** argv) {
     std::vector<Record> records;
     records.reserve((size_t)seeds * K_per_scene);
     for (int s = 0; s < seeds; ++s) {
-        auto rs = lab::make_random_scene(s, level, false, false);
+        auto rs = lab::make_random_scene(s, level, false, false,
+                                             blend_for_seed(s));
         const int W = rs.image.cols;
         for (int k = 0; k < K_per_scene; ++k) {
             int cx = (int)((k + 0.5) * W / K_per_scene);

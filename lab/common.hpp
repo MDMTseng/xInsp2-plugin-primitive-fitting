@@ -55,7 +55,9 @@ enum class NoiseLevel { None, Low, Normal, Harsh, Photo };
 RandomScene make_random_scene(int seed,
                               NoiseLevel level = NoiseLevel::Normal,
                               bool dashed_edge = false,
-                              bool bumpy_edge = false);
+                              bool bumpy_edge = false,
+                              double blend_alpha = 0.0,
+                              int    blend_partner_offset = 1000);
 
 // Evaluate a detected poly-line against ground truth.
 //   * rms_px          — root mean square vertical distance, inliers only

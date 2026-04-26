@@ -53,6 +53,7 @@ int main(int argc, char** argv) {
     lab::NoiseLevel level = lab::NoiseLevel::Normal;
     bool dashed = false;
     bool bumpy  = false;
+    double blend_alpha = 0.0;
     fs::path out_dir = fs::path(argv[0]).parent_path() / "results";
 
     for (int i = 1; i < argc; ++i) {
@@ -72,6 +73,10 @@ int main(int argc, char** argv) {
             dashed = true;
         } else if (!std::strcmp(argv[i], "--bumpy")) {
             bumpy = true;
+        } else if (!std::strcmp(argv[i], "--blend") && i + 1 < argc) {
+            blend_alpha = std::atof(argv[++i]);
+        } else if (!std::strcmp(argv[i], "--blend")) {
+            blend_alpha = 0.2;   // default blend strength
         }
     }
     const char* level_name = (level == lab::NoiseLevel::Harsh) ? " (harsh)"
@@ -120,7 +125,8 @@ int main(int argc, char** argv) {
                 dashed ? " [dashed edge]" : "",
                 bumpy  ? " [bumpy edge]"  : "");
     for (int s = 0; s < seeds; ++s) {
-        auto rs = lab::make_random_scene(s, level, dashed, bumpy);
+        auto rs = lab::make_random_scene(s, level, dashed, bumpy,
+                                         blend_alpha);
         // Save the raw (unmarked) scene for sample seeds so the input
         // can be eyeballed alongside the overlays.
         if (std::find(sample_seeds.begin(), sample_seeds.end(), s) != sample_seeds.end()) {
