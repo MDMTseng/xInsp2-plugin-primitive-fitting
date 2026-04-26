@@ -1,33 +1,30 @@
 //
 // dump_caliper_dataset.cpp — generate caliper-ROI training data.
 //
-// Produces a binary file
+// Two output formats, selected by --scene-records:
 //
-//   <out_path> = N records of:
-//       uint8[CALIPER_H][CALIPER_W]  — caliper ROI grayscale crop
-//       float                         — GT y position relative to ROI top
-//                                       (in pixels, sub-pixel)
-//       int32                         — polarity (+1 = curve has dark→bright
-//                                                   transition top-to-bottom)
+// 1. Per-caliper records (default, magic "XICAL"):
+//      header  "XICAL\0\0\0", version=1, W, H, N_records
+//      record  uint8[H][W] roi, float gt_y, int32 polarity
+//    Each surviving caliper (gt_y inside ROI) is one record.
 //
-// And a header at the start:
-//   "XICAL\0\0\0"  (8 bytes magic)
-//   uint32 version (= 1)
-//   uint32 W_caliper, H_caliper
-//   uint32 N_records
-//
-// With this, a Python loader can directly mmap-and-train.
+// 2. Scene records (--scene-records, magic "XICAS"):
+//      header  "XICAS\0\0\0", version=1, K_per_scene, W, H, N_scenes
+//      record  K × { uint8[H][W] roi, float gt_y, int32 polarity, int8 valid }
+//    All K calipers from each scene are emitted as a single record.
+//    `valid` is 0 if gt_y falls outside the ROI height (loss should
+//    mask these calipers); 1 otherwise. Required for cross-caliper
+//    architectures that need a fixed K-caliper batch per scene.
 //
 // Usage:
-//   dump_caliper_dataset <out_path> --scenes 5000 [--harsh] [--low-noise]
-//   [--calipers-per-scene K]
+//   dump_caliper_dataset <out_path> [--scenes N] [--harsh|--low-noise|--no-noise|--photo]
+//                                   [--calipers-per-scene K] [--scene-records]
 //
-// Default: 5000 scenes × 16 calipers = 80 000 records.
+// Default: 5000 scenes × 16 calipers = 80 000 records (or 5000 scene
+// records under --scene-records).
 //
-// The caliper ROI is taken at evenly-spaced x positions, half-width 1
-// (3 columns horizontally), height = CALIPER_H (default 80) centred on
-// gt.y0. The GT y position recorded is gt(x_center) − (gt.y0 −
-// CALIPER_H/2) — i.e. the y-coordinate in the ROI's local frame.
+// The caliper ROI is taken at evenly-spaced x positions, height = H
+// centred on gt.y0. GT y is in ROI-local pixels.
 
 #include "common.hpp"
 #include <opencv2/imgcodecs.hpp>
@@ -98,18 +95,79 @@ int main(int argc, char** argv) {
     fs::path out_path = argv[1];
     int seeds = 5000;
     int K_per_scene = 16;
+    bool scene_records = false;
     lab::NoiseLevel level = lab::NoiseLevel::Normal;
     for (int i = 2; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--scenes") && i + 1 < argc) {
             seeds = std::atoi(argv[++i]);
         } else if (!std::strcmp(argv[i], "--calipers-per-scene") && i + 1 < argc) {
             K_per_scene = std::atoi(argv[++i]);
-        } else if (!std::strcmp(argv[i], "--harsh"))     level = lab::NoiseLevel::Harsh;
+        } else if (!std::strcmp(argv[i], "--scene-records")) scene_records = true;
+        else if  (!std::strcmp(argv[i], "--harsh"))     level = lab::NoiseLevel::Harsh;
         else if  (!std::strcmp(argv[i], "--low-noise")) level = lab::NoiseLevel::Low;
         else if  (!std::strcmp(argv[i], "--no-noise"))  level = lab::NoiseLevel::None;
         else if  (!std::strcmp(argv[i], "--photo"))     level = lab::NoiseLevel::Photo;
     }
 
+    fs::create_directories(out_path.parent_path());
+    std::ofstream f(out_path, std::ios::binary);
+    if (!f) { std::fprintf(stderr, "failed to open %s\n", out_path.string().c_str()); return 2; }
+
+    if (scene_records) {
+        // ---- Scene records: "XICAS" format ----
+        const char     magic[8] = {'X','I','C','A','S',0,0,0};
+        const uint32_t version  = 1;
+        const uint32_t K  = (uint32_t)K_per_scene;
+        const uint32_t Wc = CAL_W, Hc = CAL_H;
+        f.write(magic, 8);
+        f.write((const char*)&version, 4);
+        f.write((const char*)&K,  4);
+        f.write((const char*)&Wc, 4);
+        f.write((const char*)&Hc, 4);
+        // N_scenes patched at the end.
+        const std::streampos n_pos = f.tellp();
+        const uint32_t n_pad = 0;
+        f.write((const char*)&n_pad, 4);
+
+        uint32_t n_written = 0;
+        std::vector<uint8_t> roi;
+        for (int s = 0; s < seeds; ++s) {
+            auto rs = lab::make_random_scene(s, level, false, false);
+            const int W = rs.image.cols;
+            // Emit K calipers for this scene back-to-back.
+            for (int k = 0; k < K_per_scene; ++k) {
+                int cx = (int)((k + 0.5) * W / K_per_scene);
+                cx = std::clamp(cx, 1, W - 2);
+                extract_caliper(rs.image, cx, rs.gt.y0, roi);
+                float gt_y = (float)gt_y_in_caliper((double)cx, rs.gt);
+                int32_t polarity = +1;
+                int8_t valid = (gt_y >= 4 && gt_y <= CAL_H - 4) ? 1 : 0;
+                f.write((const char*)roi.data(), (std::streamsize)roi.size());
+                f.write((const char*)&gt_y, sizeof(float));
+                f.write((const char*)&polarity, sizeof(int32_t));
+                f.write((const char*)&valid, sizeof(int8_t));
+            }
+            ++n_written;
+            if (n_written % 500 == 0) {
+                std::fprintf(stderr, "  generated %u / %d scenes\n",
+                             n_written, seeds);
+            }
+        }
+        // Patch N_scenes.
+        const std::streampos end_pos = f.tellp();
+        f.seekp(n_pos);
+        f.write((const char*)&n_written, 4);
+        f.seekp(end_pos);
+        const size_t per_record_bytes = (size_t)K * (CAL_H * CAL_W + 4 + 4 + 1);
+        std::fprintf(stderr, "wrote %u scene records (%u calipers each), "
+                     "%.1f MB -> %s\n",
+                     n_written, K,
+                     (24 + (double)n_written * per_record_bytes) / 1.0e6,
+                     out_path.string().c_str());
+        return 0;
+    }
+
+    // ---- Per-caliper records: "XICAL" format (default) ----
     std::vector<Record> records;
     records.reserve((size_t)seeds * K_per_scene);
     for (int s = 0; s < seeds; ++s) {
@@ -121,14 +179,7 @@ int main(int argc, char** argv) {
             Record r;
             extract_caliper(rs.image, cx, rs.gt.y0, r.roi);
             r.gt_y    = (float)gt_y_in_caliper((double)cx, rs.gt);
-            // Polarity is fixed by the lab convention (curve = dark→bright
-            // when traversed top-to-bottom in image y), but we record it
-            // explicitly so production datasets with flipped scenes
-            // remain interpretable.
             r.polarity = +1;
-            // Reject calipers whose GT y falls outside the ROI height —
-            // these would make the model learn "no edge here" cases too
-            // often. Keep only well-centred records.
             if (r.gt_y < 4 || r.gt_y > CAL_H - 4) continue;
             records.push_back(std::move(r));
         }
@@ -137,10 +188,6 @@ int main(int argc, char** argv) {
                          s + 1, seeds, records.size());
         }
     }
-
-    fs::create_directories(out_path.parent_path());
-    std::ofstream f(out_path, std::ios::binary);
-    if (!f) { std::fprintf(stderr, "failed to open %s\n", out_path.string().c_str()); return 2; }
     const char     magic[8] = {'X','I','C','A','L',0,0,0};
     const uint32_t version  = 1;
     const uint32_t Wc = CAL_W, Hc = CAL_H;
@@ -155,7 +202,7 @@ int main(int argc, char** argv) {
         f.write((const char*)&r.gt_y, sizeof(float));
         f.write((const char*)&r.polarity, sizeof(int32_t));
     }
-    std::fprintf(stderr, "wrote %u records, %.1f MB → %s\n",
+    std::fprintf(stderr, "wrote %u records, %.1f MB -> %s\n",
                  N,
                  (8 + 16 + (double)N * (CAL_H * CAL_W + 4 + 4)) / 1.0e6,
                  out_path.string().c_str());

@@ -30,8 +30,8 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import ConcatDataset, DataLoader, random_split
 
-from dataset import CaliperDataset
-from model import CaliperEdgeNet, soft_argmax
+from dataset import CaliperDataset, SceneDataset, detect_format
+from model import CaliperEdgeNet, CrossCaliperEdgeNet, soft_argmax
 
 
 # All status prints flush immediately so background-task log files
@@ -65,7 +65,14 @@ def parse_args():
 def main():
     args = parse_args()
     log(f"device: {args.device}")
-    parts = [CaliperDataset(p) for p in args.dataset]
+    fmts = [detect_format(p) for p in args.dataset]
+    if len(set(fmts)) != 1:
+        raise ValueError(f"mix of dataset formats: {fmts}")
+    fmt = fmts[0]
+    is_scene = (fmt == "XICAS")
+    log(f"dataset format: {fmt}{' (cross-caliper)' if is_scene else ''}")
+    cls = SceneDataset if is_scene else CaliperDataset
+    parts = [cls(p) for p in args.dataset]
     if len(parts) == 1:
         ds = parts[0]
     else:
@@ -89,9 +96,10 @@ def main():
     val_dl   = DataLoader(val_ds,   batch_size=args.bs, shuffle=False,
                           num_workers=0)
 
-    model = CaliperEdgeNet().to(args.device)
+    model_cls = CrossCaliperEdgeNet if is_scene else CaliperEdgeNet
+    model = model_cls().to(args.device)
     n_params = sum(p.numel() for p in model.parameters())
-    log(f"model parameters: {n_params:,}")
+    log(f"model: {model_cls.__name__}, parameters: {n_params:,}")
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
 
@@ -104,6 +112,39 @@ def main():
                     "time_s", "saved"])
     log(f"metrics CSV → {csv_path}")
 
+    def step_losses(batch, training: bool):
+        # Returns (loss, l1_for_logging, weight_count)
+        x    = batch["x"].to(args.device)
+        y    = batch["target"].to(args.device)
+        gt_y = batch["gt_y"].to(args.device)
+        if is_scene:
+            valid = batch["valid"].to(args.device)             # [B, K]
+            logits = model(x)                                  # [B, K, H]
+            # Heatmap MSE — masked by valid (zero where invalid).
+            sig  = torch.sigmoid(logits)
+            err  = (sig - y).pow(2).mean(dim=-1)               # [B, K]
+            mask_sum = valid.sum().clamp(min=1.0)
+            loss_hm = (err * valid).sum() / mask_sum
+            # Soft-argmax L1 — also masked.
+            B, K, H = logits.shape
+            p = torch.softmax(logits, dim=-1)
+            idx = torch.arange(H, device=logits.device, dtype=logits.dtype)
+            yhat = (p * idx).sum(dim=-1)                       # [B, K]
+            l1_per = (yhat - gt_y).abs()                       # [B, K]
+            loss_arg = (l1_per * valid).sum() / mask_sum
+            wn = int(mask_sum.item())
+            l1_avg = (l1_per * valid).sum().item() / max(1, wn)
+        else:
+            logits = model(x)
+            loss_hm = F.mse_loss(torch.sigmoid(logits), y)
+            yhat = soft_argmax(logits)
+            l1_avg_t = F.l1_loss(yhat, gt_y)
+            loss_arg = l1_avg_t
+            wn = int(x.size(0))
+            l1_avg = l1_avg_t.item()
+        loss = args.w_heatmap * loss_hm + args.w_argmax * loss_arg
+        return loss, l1_avg, wn
+
     best_val = float("inf")
     epochs_since_improve = 0
     stop_reason = "completed all epochs"
@@ -113,21 +154,12 @@ def main():
         sum_loss = 0.0
         n = 0
         for batch in train_dl:
-            x = batch["x"].to(args.device)
-            y = batch["target"].to(args.device)
-            gt_y = batch["gt_y"].to(args.device)
-            logits = model(x)
-            # Heatmap MSE: encourages spatial peak shape.
-            loss_hm = F.mse_loss(torch.sigmoid(logits), y)
-            # Soft-argmax L1: direct sub-pixel supervision.
-            yhat = soft_argmax(logits)
-            loss_arg = F.l1_loss(yhat, gt_y)
-            loss = args.w_heatmap * loss_hm + args.w_argmax * loss_arg
+            loss, _, wn = step_losses(batch, training=True)
             opt.zero_grad()
             loss.backward()
             opt.step()
-            sum_loss += loss.item() * x.size(0)
-            n += x.size(0)
+            sum_loss += loss.item() * wn
+            n += wn
         sched.step()
         train_loss = sum_loss / max(1, n)
 
@@ -138,17 +170,10 @@ def main():
         v_l1 = 0.0
         with torch.no_grad():
             for batch in val_dl:
-                x = batch["x"].to(args.device)
-                y = batch["target"].to(args.device)
-                gt_y = batch["gt_y"].to(args.device)
-                logits = model(x)
-                loss_hm = F.mse_loss(torch.sigmoid(logits), y)
-                yhat = soft_argmax(logits)
-                l1 = F.l1_loss(yhat, gt_y)
-                loss = args.w_heatmap * loss_hm + args.w_argmax * l1
-                v_loss += loss.item() * x.size(0)
-                v_l1   += l1.item()   * x.size(0)
-                v_n += x.size(0)
+                loss, l1_avg, wn = step_losses(batch, training=False)
+                v_loss += loss.item() * wn
+                v_l1   += l1_avg     * wn
+                v_n    += wn
         v_loss /= max(1, v_n)
         v_l1   /= max(1, v_n)
         dt = time.time() - t0
