@@ -66,6 +66,124 @@ Two observations:
    y-direction edges — a property that's harder to encode in a
    hand-crafted filter without also rejecting weak edges.
 
+## Trained-CNN v5 — cross-caliper feature exchange
+
+The biggest single quality jump in any lab algorithm to date.
+v4 already established that wide-context per-caliper (CAL_W=15)
+gets to 0.0% outlier on normal+photo. v5 fixes the remaining 1%
+on harsh by letting calipers exchange features mid-network.
+
+### Mechanism
+
+The earlier per-caliper CNN sees only one caliper at a time. False
+stripes that span 3-5 calipers fool each one independently — the
+downstream sparse DP can correct some failures via smoothness, but
+not all.  v5 inserts a 2-D Conv2d mixing layer between the
+per-caliper feature extractor and the final logit head:
+
+```
+Input [B_scene, K=16 calipers, C=15 cols, H=80 y]
+  ↓
+Per-caliper Conv1d×2 (15→16→32)            # local features in y
+  ↓ reshape to [B, 32, K, H]
+Cross-caliper Conv2d×2 (kernel 3×7)        # mix neighbour calipers
+  ↓ reshape back to [B·K, 32, H]
+Per-caliper Conv1d 1×1 → logits [B, K, 80]
+```
+
+The kernel `(3 across calipers, 7 in y)` lets each caliper see its
+±1 neighbour's features directly. Two stages → effective receptive
+field ±2 calipers (~40 px in image x).
+
+Total parameters: 47 K (vs 11 K for v4). 1.8 ms PyTorch forward per
+scene; 2.6 ms in cv::dnn (slightly heavier than v4's 0.9 ms because
+of the 2-D conv + larger feature volume).
+
+### Numbers (100 seeds × 3 noise regimes)
+
+| Regime | Algorithm | RMS p50 | RMS p90 | Coverage | Outlier | ms p50 |
+|---|---|---:|---:|---:|---:|---:|
+| normal | `caliper_cnn_cross` (v5) | 0.196 | 0.293 | **99.8%** | **0.0%** | 2.6 |
+|        | `caliper_cnn` (v4)        | 0.224 | 0.390 | 99.6% | 0.0% | 0.9 |
+|        | `spline_knot_dp`          | 0.118 | 0.259 | 99.3% | 3.0% | 4.0 |
+| harsh  | `caliper_cnn_cross` (v5) | 0.228 | 0.396 | **99.5%** | **0.0%** | 2.7 |
+|        | `caliper_cnn` (v4)        | 0.304 | 0.524 | 98.7% | 1.0% | 1.2 |
+|        | `spline_knot_dp`          | 0.163 | 0.438 | 93.2% | 8.0% | 4.8 |
+| photo  | `caliper_cnn_cross` (v5) | 0.197 | 0.302 | **99.8%** | **0.0%** | 2.5 |
+|        | `caliper_cnn` (v4)        | 0.227 | 0.342 | 99.6% | 0.0% | 1.0 |
+|        | `spline_knot_dp`          | 0.124 | 0.268 | 99.3% | 3.0% | 5.4 |
+
+**v5 is the first lab algorithm to reach 0.0% outlier in *all
+three* noise regimes**, and 99.5%+ coverage in all three. The
+remaining sub-pixel-precision gap to spline_knot_dp on the
+cleanest scenes (0.196 vs 0.118 RMS p50) is the dense-DP advantage;
+v5 closes the harsh-mode worst-case where DP also struggles.
+
+### Why cross-caliper helps on harsh specifically
+
+In harsh mode the lab generator emits 6–12 false stripes per scene
+spanning up to 30% of W. Roughly 79% of calipers see a stripe in
+their search band (vs 45% in normal). With per-caliper inference
+those calipers must each independently distinguish stripe vs curve
+from a 15-col context — sometimes the stripe edge texture is
+ambiguous within a single caliper window.
+
+With cross-caliper feature exchange the model learns:
+- "Caliper i sees a peak at y=110, and so does i±1 at the same y,
+  but neighbours i±2 do not" → likely a 60-80 px stripe whose ends
+  fall outside the cluster. Suppress.
+- "Caliper i sees a peak at y=110 and so does *every* other
+  caliper at a smoothly varying y" → real curve. Keep.
+
+This is a pattern hand-crafted DP can't represent at the cost level
+because it operates on points, not features.
+
+### Validation training curves
+
+V5 trained 60 epochs on normal+harsh+photo union (13,000 scene
+records, 207 K caliper-equivalents). Final val_y_L1 = **0.093 px**:
+
+| Model         | val_y_L1 | params  | Δ vs v3 |
+|---|---:|---:|---:|
+| v3 (3-ch, per-caliper) | 0.350 px |  10 K | — |
+| v4 (15-ch, per-caliper) | 0.156 px |  11 K | 2.2× tighter |
+| **v5 (15-ch, cross-caliper)** | **0.093 px** |  47 K | **3.8× tighter** |
+
+### Reproducing v5
+
+```sh
+# Wide-context scene-record dump
+./build/Release/dump_caliper_dataset.exe lab/cnn/data/normal_sc.bin \
+    --scenes 5000 --calipers-per-scene 16 --scene-records
+./build/Release/dump_caliper_dataset.exe lab/cnn/data/harsh_sc.bin \
+    --scenes 3000 --harsh --scene-records
+./build/Release/dump_caliper_dataset.exe lab/cnn/data/photo_sc.bin \
+    --scenes 5000 --photo --scene-records
+
+cd lab/cnn
+python train.py data/normal_sc.bin data/harsh_sc.bin data/photo_sc.bin \
+    --epochs 60 --bs 32 --patience 10 --out caliper_edge_v5.pt
+python plot_metrics.py caliper_edge_v5.pt.metrics.csv
+python export_onnx.py caliper_edge_v5.pt --out caliper_edge_v5.onnx --K 16
+
+cd ../..
+XICAL_ONNX_CROSS=$(pwd)/lab/cnn/caliper_edge_v5.onnx \
+    ./lab/build/Release/lab.exe --seeds 100
+```
+
+### Re-tuning when caliper geometry changes
+
+Architectural constants baked into the model:
+
+| Parameter | Hardcoded in | Retrain on change? |
+|---|---|---|
+| `CAL_W` (column count, =15) | First Conv1d weight shape | **Yes** |
+| `CAL_H` (height, =80) | Soft-argmax range, RF scale | **Yes** (or sub-pixel quality degrades) |
+| `N_CAL` (caliper count, =16, **cross only**) | Cross Conv2d trained-with K | No retrain, but re-export ONNX with dynamic K-axis |
+
+For the per-caliper v4 model, N_CAL is a free batch dim — any K
+works at inference without retraining.
+
 ## Trained-CNN v4 — wide-context input (CAL_W = 15)
 
 The biggest single quality jump in the CNN line of work. Per-caliper

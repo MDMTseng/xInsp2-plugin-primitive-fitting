@@ -194,7 +194,127 @@ std::vector<int> dp_assign(const std::vector<std::vector<Hit>>& per_cal) {
     return picks;
 }
 
+// ---- Cross-caliper variant: 4-D input [1, N_CAL, CAL_W, CAL_H] -------
+// Model: CrossCaliperEdgeNet (lab/cnn/model.py). Loaded from a separate
+// env var (XICAL_ONNX_CROSS) so per-caliper and cross-caliper models can
+// coexist in the same benchmark run.
+static ModelHandle g_model_cross;
+static std::mutex  g_model_cross_mu;
+
+ModelHandle& get_model_cross() {
+    std::lock_guard<std::mutex> lk(g_model_cross_mu);
+    if (!g_model_cross.tried) {
+        g_model_cross.tried = true;
+        const char* onnx_path = std::getenv("XICAL_ONNX_CROSS");
+        if (onnx_path && onnx_path[0]) {
+            try {
+                g_model_cross.net = cv::dnn::readNetFromONNX(onnx_path);
+                g_model_cross.loaded = !g_model_cross.net.empty();
+            } catch (const cv::Exception&) {
+                g_model_cross.loaded = false;
+            }
+        }
+    }
+    return g_model_cross;
+}
+
+cv::Mat build_blob_cross(const cv::Mat& gray, const std::vector<int>& cxs,
+                         double y0) {
+    const int H = gray.rows, W = gray.cols;
+    const int N = (int)cxs.size();
+    int dims[4] = {1, N, CAL_W, CAL_H};
+    cv::Mat blob(4, dims, CV_32F);
+    int y_top_image = (int)std::round(y0) - CAL_H / 2;
+    // Layout: [1][N][CAL_W][CAL_H]. Step into batch=0, then the rest is
+    // a contiguous [N][CAL_W][CAL_H] block we can fill linearly.
+    float* base = blob.ptr<float>();
+    for (int b = 0; b < N; ++b) {
+        float* dst_b = base + (size_t)b * CAL_W * CAL_H;
+        int cx = cxs[b];
+        for (int c = 0; c < CAL_W; ++c) {
+            float* dst_ch = dst_b + (size_t)c * CAL_H;
+            int x = std::clamp(cx + c - CAL_W / 2, 0, W - 1);
+            for (int i = 0; i < CAL_H; ++i) {
+                int y = std::clamp(y_top_image + i, 0, H - 1);
+                dst_ch[i] = gray.ptr<uint8_t>(y)[x] / 255.0f;
+            }
+        }
+    }
+    return blob;
+}
+
 } // namespace
+
+std::vector<cv::Point2d> detect_caliper_cnn_cross(const cv::Mat& gray,
+                                                  const GroundTruth& gt) {
+    auto& mh = get_model_cross();
+    if (!mh.loaded) return {};
+
+    const int W = gray.cols;
+    const double y0 = gt.y0;
+
+    std::vector<int> cxs(N_CAL);
+    for (int i = 0; i < N_CAL; ++i) {
+        cxs[i] = (int)std::round((i + 0.5) * (double)W / N_CAL);
+        cxs[i] = std::clamp(cxs[i], 1, W - 2);
+    }
+
+    cv::Mat blob = build_blob_cross(gray, cxs, y0);
+    std::lock_guard<std::mutex> lk(g_model_cross_mu);
+    cv::Mat out;
+    try {
+        mh.net.setInput(blob);
+        out = mh.net.forward();
+        if (!out.isContinuous()) out = out.clone();
+    } catch (const cv::Exception&) {
+        mh.loaded = false;
+        return {};
+    }
+    // out is [1, N_CAL, CAL_H] — total N_CAL * CAL_H floats.
+    sigmoid_inplace(out.ptr<float>(), N_CAL * CAL_H);
+
+    // Reuse the per-caliper NMS + sparse-DP pipeline (per_cal layout).
+    std::vector<std::vector<Hit>> per_cal(N_CAL);
+    for (int i = 0; i < N_CAL; ++i) {
+        const float* probs = out.ptr<float>() + (size_t)i * CAL_H;
+        auto peaks = extract_peaks(probs, y0);
+        for (const auto& p : peaks) {
+            per_cal[i].push_back({(double)cxs[i], p.first, p.second, i});
+        }
+    }
+    for (auto& v : per_cal) if (v.empty()) v.push_back({0.0, y0, 0.0, -1});
+    std::vector<int> picks = dp_assign(per_cal);
+
+    std::vector<cv::Point2d> picks_xy;
+    picks_xy.reserve(N_CAL);
+    for (int i = 0; i < N_CAL; ++i) {
+        if (picks[i] < 0) continue;
+        const Hit& h = per_cal[i][picks[i]];
+        if (h.caliper_id < 0) continue;
+        picks_xy.emplace_back(h.x, h.y);
+    }
+    if (picks_xy.size() < 2) {
+        std::vector<cv::Point2d> fb;
+        fb.reserve(W);
+        for (int x = 0; x < W; ++x) fb.emplace_back((double)x, y0);
+        return fb;
+    }
+    std::vector<cv::Point2d> out_dense;
+    out_dense.reserve(W);
+    int p = 0;
+    for (int x = 0; x < W; ++x) {
+        while (p + 1 < (int)picks_xy.size() && picks_xy[p + 1].x <= x) ++p;
+        if (p >= (int)picks_xy.size() - 1) {
+            out_dense.emplace_back((double)x, picks_xy.back().y);
+        } else {
+            const auto& a = picks_xy[p];
+            const auto& b = picks_xy[p + 1];
+            double t = (x - a.x) / std::max(1e-9, b.x - a.x);
+            out_dense.emplace_back((double)x, (1.0 - t) * a.y + t * b.y);
+        }
+    }
+    return out_dense;
+}
 
 std::vector<cv::Point2d> detect_caliper_cnn(const cv::Mat& gray,
                                             const GroundTruth& gt) {

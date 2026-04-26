@@ -15,7 +15,7 @@ from pathlib import Path
 
 import torch
 
-from model import CaliperEdgeNet
+from model import CaliperEdgeNet, CrossCaliperEdgeNet
 
 
 def parse_args():
@@ -26,6 +26,8 @@ def parse_args():
                     help="input channels (caliper width). 0 = auto-detect "
                          "from checkpoint's first conv weight.")
     ap.add_argument("--H", type=int, default=80)
+    ap.add_argument("--K", type=int, default=16,
+                    help="K calipers per scene (cross-caliper models only)")
     ap.add_argument("--opset", type=int, default=13)
     return ap.parse_args()
 
@@ -35,26 +37,47 @@ def main():
     ckpt = torch.load(args.checkpoint, map_location="cpu")
     H = args.H if args.H else int(ckpt.get("H", 80))
     state = ckpt["state_dict"]
-    # Detect input-channel count from the first Conv1d weight, shape
-    # [out_channels, in_channels, kernel].
+    # Detect model type from state-dict key prefixes.
+    is_cross = any(k.startswith("local.") or k.startswith("cross.") for k in state)
+    # Detect input-channel count from the first Conv1d weight (shape
+    # [out_channels, in_channels, kernel]).
     first_conv_key = next(k for k in state if k.endswith(".weight") and state[k].ndim == 3)
     W = args.W if args.W else int(state[first_conv_key].shape[1])
-    model = CaliperEdgeNet(in_ch=W)
-    model.load_state_dict(state)
-    model.eval()
-    dummy = torch.zeros(1, W, H, dtype=torch.float32)
+
     out_path = Path(args.out)
-    torch.onnx.export(
-        model, dummy, str(out_path),
-        opset_version=args.opset,
-        input_names=["caliper"],
-        output_names=["logits"],
-        dynamic_axes={
-            "caliper": {0: "batch"},
-            "logits":  {0: "batch"},
-        },
-    )
-    print(f"exported {out_path}  (input [B,{W},{H}] -> output [B,{H}])")
+    if is_cross:
+        model = CrossCaliperEdgeNet(in_ch=W)
+        model.load_state_dict(state)
+        model.eval()
+        K = args.K
+        dummy = torch.zeros(1, K, W, H, dtype=torch.float32)
+        torch.onnx.export(
+            model, dummy, str(out_path),
+            opset_version=args.opset,
+            input_names=["calipers"],
+            output_names=["logits"],
+            dynamic_axes={
+                "calipers": {0: "batch"},
+                "logits":   {0: "batch"},
+            },
+        )
+        print(f"exported {out_path}  (CrossCaliper input [B,{K},{W},{H}] -> output [B,{K},{H}])")
+    else:
+        model = CaliperEdgeNet(in_ch=W)
+        model.load_state_dict(state)
+        model.eval()
+        dummy = torch.zeros(1, W, H, dtype=torch.float32)
+        torch.onnx.export(
+            model, dummy, str(out_path),
+            opset_version=args.opset,
+            input_names=["caliper"],
+            output_names=["logits"],
+            dynamic_axes={
+                "caliper": {0: "batch"},
+                "logits":  {0: "batch"},
+            },
+        )
+        print(f"exported {out_path}  (input [B,{W},{H}] -> output [B,{H}])")
 
 
 if __name__ == "__main__":
