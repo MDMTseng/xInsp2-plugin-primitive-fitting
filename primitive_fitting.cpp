@@ -28,6 +28,7 @@
 #include <xi/xi_json.hpp>
 
 #include <opencv2/core.hpp>
+#include <opencv2/dnn.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 
@@ -141,6 +142,18 @@ struct Config {
     // Criteria — activated iff > 0.
     double min_length_px    = 0.0;
     double min_inlier_ratio = 0.0;
+
+    // Optional learned per-caliper peak filter (lab/algo_caliper_cnn).
+    // When enabled and `cnn_onnx_path` loads successfully, the
+    // hand-crafted gradient + NMS extractor is replaced by a 1-D CNN
+    // forward pass batched over all calipers. Constraints (must
+    // match training-time setup):
+    //   * caliper_width must be 3 (model expects 3-channel input)
+    //   * caliper_span  must be 80
+    // Falls back to the classical extractor on load failure or shape
+    // mismatch — never blocks the fit.
+    bool        use_cnn_peak_filter = false;
+    std::string cnn_onnx_path;
 };
 
 // Region types — only Line is populated in Phase 1; the others carry
@@ -456,6 +469,9 @@ private:
         D("poly_max_slope_deg",  cfg_.poly_max_slope_deg);
         D("min_length_px",       cfg_.min_length_px);
         D("min_inlier_ratio",    cfg_.min_inlier_ratio);
+        B("use_cnn_peak_filter", cfg_.use_cnn_peak_filter);
+        if (p["cnn_onnx_path"].is_string())
+            cfg_.cnn_onnx_path = p["cnn_onnx_path"].as_string();
         cfg_.num_calipers  = std::max(3, cfg_.num_calipers);
         cfg_.caliper_width = std::max(1, cfg_.caliper_width);
         cfg_.caliper_span  = std::max(5, cfg_.caliper_span);
@@ -523,7 +539,17 @@ private:
             return r;
         }
 
-        find_edges(gray, scan, cfg, r.hits);
+        // Peak extraction: CNN if requested + ONNX loads, else classical.
+        bool used_cnn = false;
+        if (cfg.use_cnn_peak_filter) {
+            if (ensure_cnn_loaded_locked()) {
+                find_edges_cnn(gray, scan, cfg, cnn_net_, r.hits);
+                used_cnn = true;
+            }
+        }
+        if (!used_cnn) {
+            find_edges(gray, scan, cfg, r.hits);
+        }
         r.total_hits = (int)r.hits.size();
         int min_hits = 3;
         if (cfg.fit_model == FitModel::Ellipse)    min_hits = 5;
@@ -638,6 +664,134 @@ private:
                 h.pos.y = s.pos.y + v_sub * ey.y;
                 h.strength = p.mag;
                 h.t = (double)i / (double)std::max<size_t>(1, scan.size() - 1);
+                out_hits.push_back(h);
+            }
+        }
+    }
+
+    // CNN peak finder shape constants — must match the model trained
+    // by `lab/cnn`. CALIPER_W_CNN is the input channel count;
+    // CALIPER_H_CNN is the y-axis spatial dim. If the user reconfigures
+    // the plugin's `caliper_width` / `caliper_span` away from these
+    // values the CNN path will silently rescale the ROI.
+    static constexpr int CALIPER_W_CNN = 3;
+    static constexpr int CALIPER_H_CNN = 80;
+
+    // Lazy-load the ONNX model. Reloads if the path changed. Caller
+    // holds mu_; accesses cnn_net_ / cnn_loaded_path_ / cnn_loaded_.
+    bool ensure_cnn_loaded_locked() const {
+        if (cfg_.cnn_onnx_path.empty()) {
+            cnn_loaded_ = false;
+            return false;
+        }
+        if (cnn_loaded_ && cnn_loaded_path_ == cfg_.cnn_onnx_path)
+            return true;
+        try {
+            cnn_net_ = cv::dnn::readNetFromONNX(cfg_.cnn_onnx_path);
+            cnn_loaded_path_ = cfg_.cnn_onnx_path;
+            cnn_loaded_ = !cnn_net_.empty();
+        } catch (const cv::Exception&) {
+            cnn_loaded_ = false;
+        }
+        return cnn_loaded_;
+    }
+
+    // Replace the per-caliper peak extractor with a 1-D CNN forward
+    // pass. Builds [N, 3, 80] blob across all calipers, runs cv::dnn,
+    // sigmoid + per-caliper NMS top-N, sub-pixel parabolic refine.
+    static void find_edges_cnn(const cv::Mat& gray,
+                               const std::vector<CaliperSample>& scan,
+                               const Config& cfg,
+                               cv::dnn::Net& net,
+                               std::vector<CaliperHit>& out_hits) {
+        const int N = (int)scan.size();
+        if (N == 0) return;
+        int dims[3] = {N, CALIPER_W_CNN, CALIPER_H_CNN};
+        cv::Mat blob(3, dims, CV_32F);
+        for (int b = 0; b < N; ++b) {
+            const auto& s = scan[b];
+            const cv::Point2d ey(s.normal);
+            const cv::Point2d ex(-ey.y, ey.x);
+            float* dst_b = blob.ptr<float>(b);
+            for (int c = 0; c < CALIPER_W_CNN; ++c) {
+                float* dst_ch = dst_b + (size_t)c * CALIPER_H_CNN;
+                double off_x = (double)(c - CALIPER_W_CNN / 2);
+                for (int t = 0; t < CALIPER_H_CNN; ++t) {
+                    double v  = -CALIPER_H_CNN * 0.5 + t + 0.5;
+                    double sx = s.pos.x + off_x * ex.x + v * ey.x;
+                    double sy = s.pos.y + off_x * ex.y + v * ey.y;
+                    int ix = (int)std::round(sx);
+                    int iy = (int)std::round(sy);
+                    float val = 0.0f;
+                    if (ix >= 0 && iy >= 0 && ix < gray.cols && iy < gray.rows) {
+                        val = gray.at<uint8_t>(iy, ix) / 255.0f;
+                    }
+                    dst_ch[t] = val;
+                }
+            }
+        }
+        net.setInput(blob);
+        cv::Mat out = net.forward();   // [N, 80] logits
+        if (!out.isContinuous()) out = out.clone();
+        float* p_all = out.ptr<float>();
+        const int total = N * CALIPER_H_CNN;
+        for (int i = 0; i < total; ++i)
+            p_all[i] = 1.0f / (1.0f + std::exp(-p_all[i]));
+
+        // Threshold reuses min_edge_strength but now interpreted as a
+        // 0-255 scaling of the desired probability cut-off (so e.g.
+        // min_edge_strength=80 ⇒ keep peaks with prob ≥ 0.31). 0 → 0.05
+        // floor so something is always kept on a clean edge.
+        const double prob_thr = std::max(0.05,
+            (double)cfg.min_edge_strength / 255.0);
+        const int sep = std::max(1, cfg.edge_min_separation_px);
+
+        for (int b = 0; b < N; ++b) {
+            const auto& s = scan[b];
+            const cv::Point2d ey(s.normal);
+            const float* probs = out.ptr<float>(b);
+
+            struct Peak { int t; double prob; };
+            std::vector<Peak> peaks;
+            for (int t = 1; t < CALIPER_H_CNN - 1; ++t) {
+                double pp = probs[t];
+                if (pp < prob_thr) continue;
+                if (probs[t - 1] >= pp) continue;
+                if (probs[t + 1] >  pp) continue;
+                peaks.push_back({t, pp});
+            }
+            if (peaks.empty()) continue;
+            std::sort(peaks.begin(), peaks.end(),
+                [](const Peak& a, const Peak& bb){ return a.prob > bb.prob; });
+            const double max_prob = peaks.front().prob;
+            const double alpha_thr = cfg.top_n_min_alpha > 0
+                ? cfg.top_n_min_alpha * max_prob : 0.0;
+            std::vector<Peak> kept;
+            kept.reserve(std::min<size_t>(peaks.size(),
+                (size_t)cfg.top_n_per_caliper));
+            for (const auto& p : peaks) {
+                if (p.prob < alpha_thr) break;
+                bool too_close = false;
+                for (const auto& k : kept)
+                    if (std::abs(p.t - k.t) < sep) { too_close = true; break; }
+                if (too_close) continue;
+                kept.push_back(p);
+                if ((int)kept.size() >= cfg.top_n_per_caliper) break;
+            }
+            for (const auto& p : kept) {
+                double pm = (p.t > 0)            ? probs[p.t - 1] : probs[p.t];
+                double p0 = probs[p.t];
+                double pp = (p.t < CALIPER_H_CNN - 1) ? probs[p.t + 1] : probs[p.t];
+                double denom = pm - 2.0 * p0 + pp;
+                double off = (std::abs(denom) > 1e-9)
+                    ? 0.5 * (pm - pp) / denom : 0.0;
+                if (off < -1.0 || off > 1.0) off = 0.0;
+                double v_sub = -CALIPER_H_CNN * 0.5 + p.t + 0.5 + off;
+                CaliperHit h;
+                h.pos.x = s.pos.x + v_sub * ey.x;
+                h.pos.y = s.pos.y + v_sub * ey.y;
+                h.strength = p.prob * 255.0;          // legacy 0-255 scale
+                h.t = (double)b / (double)std::max(1, N - 1);
                 out_hits.push_back(h);
             }
         }
@@ -1651,7 +1805,9 @@ private:
             .set("poly_reject_sigma",   cfg_.poly_reject_sigma)
             .set("poly_max_slope_deg",  cfg_.poly_max_slope_deg)
             .set("min_length_px",       cfg_.min_length_px)
-            .set("min_inlier_ratio",    cfg_.min_inlier_ratio);
+            .set("min_inlier_ratio",    cfg_.min_inlier_ratio)
+            .set("use_cnn_peak_filter", cfg_.use_cnn_peak_filter)
+            .set("cnn_onnx_path",       cfg_.cnn_onnx_path);
 
         root.set("line", xi::Json::object()
             .set("p1x", line_.p1x).set("p1y", line_.p1y)
@@ -1793,6 +1949,13 @@ private:
     cv::Mat     last_frame_gray_;
     cv::Mat     last_overlay_;
     FitResult   last_result_{};
+
+    // CNN peak filter — lazy-loaded the first time `use_cnn_peak_filter`
+    // is true and `cnn_onnx_path` is non-empty. Reloaded transparently if
+    // the user changes the path.
+    mutable cv::dnn::Net cnn_net_;
+    mutable std::string  cnn_loaded_path_;
+    mutable bool         cnn_loaded_ = false;
 };
 
 XI_PLUGIN_IMPL(PrimitiveFitting)

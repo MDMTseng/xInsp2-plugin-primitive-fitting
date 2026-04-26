@@ -170,6 +170,15 @@
         <input type="number" id="poly_max_slope_deg" min="0" max="89" step="1" value="0">
     </div>
 
+    <h3>Learned Peak Filter <span class="hint" style="text-transform:none;letter-spacing:0">(optional CNN)</span></h3>
+    <div class="hint">When enabled, replaces the per-caliper gradient + NMS peak detector with a 1-D CNN forward pass over all calipers. Requires an ONNX file produced by lab/cnn (input [B,3,80] → output [B,80]). Reuses Min edge strength (0–255) as the probability threshold × 255. Falls back to classical extraction on load failure.</div>
+    <div class="row">
+        <label>CNN peak filter:</label>
+        <input type="checkbox" id="use_cnn_peak_filter">
+        <label>ONNX path:</label>
+        <input type="text" id="cnn_onnx_path" style="width: 280px" placeholder="e.g. C:/.../caliper_edge_union.onnx">
+    </div>
+
     <h3>Inspection Criteria <span class="hint" style="text-transform:none;letter-spacing:0">(0 disables)</span></h3>
     <div class="row">
         <label>Min length (px):</label>
@@ -405,6 +414,8 @@
             poly_reject_sigma:  +document.getElementById('poly_reject_sigma').value,
             min_length_px:      +document.getElementById('min_length_px').value,
             min_inlier_ratio:   +document.getElementById('min_inlier_ratio').value,
+            use_cnn_peak_filter: document.getElementById('use_cnn_peak_filter').checked,
+            cnn_onnx_path:       document.getElementById('cnn_onnx_path').value,
         };
         vscode.postMessage({ type: 'exchange', cmd: cfg });
         drawOverlay();
@@ -437,6 +448,8 @@
             document.getElementById('poly_reject_sigma').value   = s.poly_reject_sigma;
             document.getElementById('min_length_px').value       = s.min_length_px;
             document.getElementById('min_inlier_ratio').value    = s.min_inlier_ratio;
+            document.getElementById('use_cnn_peak_filter').checked = !!s.use_cnn_peak_filter;
+            document.getElementById('cnn_onnx_path').value       = s.cnn_onnx_path ?? '';
             configHydrated = true;
         }
         if (!lineHydrated && !line && !drag && s.line &&
