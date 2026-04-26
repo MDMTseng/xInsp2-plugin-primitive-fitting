@@ -3,11 +3,25 @@
 Usage:
     python train.py <dataset.bin> [--out model.pt] [--epochs 50] [--bs 256]
                                   [--lr 1e-3] [--val-frac 0.1]
+                                  [--patience N] [--metrics-csv path]
+
+Real-time monitoring:
+    * stdout is flushed each epoch so a `tail -f` on the redirected log
+      shows per-epoch progress immediately, even when run as a
+      background task.
+    * `--metrics-csv` (default: <out>.metrics.csv) writes one row per
+      epoch with epoch / train_loss / val_loss / val_y_L1 / time_s,
+      so external tools can plot or check for plateau.
+    * `--patience N` enables early-stop: after N consecutive epochs
+      without a val_loss improvement, training halts and the best
+      checkpoint is kept.
 """
 from __future__ import annotations
 import argparse
+import csv
 import math
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -18,6 +32,12 @@ from torch.utils.data import ConcatDataset, DataLoader, random_split
 
 from dataset import CaliperDataset
 from model import CaliperEdgeNet, soft_argmax
+
+
+# All status prints flush immediately so background-task log files
+# stay readable in real time.
+def log(msg: str) -> None:
+    print(msg, flush=True)
 
 
 def parse_args():
@@ -34,12 +54,17 @@ def parse_args():
                     help="weight on Gaussian-heatmap MSE loss")
     ap.add_argument("--w-argmax", type=float, default=0.5,
                     help="weight on soft-argmax L1 loss (sub-pixel supervision)")
+    ap.add_argument("--patience", type=int, default=0,
+                    help="early-stop after N consecutive epochs without "
+                         "val_loss improvement; 0 disables")
+    ap.add_argument("--metrics-csv", type=str, default="",
+                    help="per-epoch metrics CSV (default: <out>.metrics.csv)")
     return ap.parse_args()
 
 
 def main():
     args = parse_args()
-    print(f"device: {args.device}")
+    log(f"device: {args.device}")
     parts = [CaliperDataset(p) for p in args.dataset]
     if len(parts) == 1:
         ds = parts[0]
@@ -52,8 +77,8 @@ def main():
         # Expose .W/.H for downstream prints.
         ds.W, ds.H = parts[0].W, parts[0].H
     sizes = [len(p) for p in parts]
-    print(f"loaded {len(ds)} records ({' + '.join(map(str, sizes))}), "
-          f"ROI = {ds.W}x{ds.H}")
+    log(f"loaded {len(ds)} records ({' + '.join(map(str, sizes))}), "
+        f"ROI = {ds.W}x{ds.H}")
 
     n_val = int(len(ds) * args.val_frac)
     n_train = len(ds) - n_val
@@ -66,12 +91,22 @@ def main():
 
     model = CaliperEdgeNet().to(args.device)
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"model parameters: {n_params:,}")
+    log(f"model parameters: {n_params:,}")
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
 
-    best_val = float("inf")
     out_path = Path(args.out)
+    csv_path = Path(args.metrics_csv) if args.metrics_csv else \
+               out_path.with_suffix(out_path.suffix + ".metrics.csv")
+    csv_f = open(csv_path, "w", newline="", buffering=1)  # line-buffered
+    csv_w = csv.writer(csv_f)
+    csv_w.writerow(["epoch", "train_loss", "val_loss", "val_y_L1_px",
+                    "time_s", "saved"])
+    log(f"metrics CSV → {csv_path}")
+
+    best_val = float("inf")
+    epochs_since_improve = 0
+    stop_reason = "completed all epochs"
     for epoch in range(args.epochs):
         model.train()
         t0 = time.time()
@@ -117,18 +152,30 @@ def main():
         v_loss /= max(1, v_n)
         v_l1   /= max(1, v_n)
         dt = time.time() - t0
-        print(f"epoch {epoch+1:3d}/{args.epochs}  "
-              f"train={train_loss:.5f}  val={v_loss:.5f}  "
-              f"val_y_L1={v_l1:.4f} px  ({dt:.1f}s)")
-        if v_loss < best_val:
+        improved = v_loss < best_val
+        log(f"epoch {epoch+1:3d}/{args.epochs}  "
+            f"train={train_loss:.5f}  val={v_loss:.5f}  "
+            f"val_y_L1={v_l1:.4f} px  ({dt:.1f}s)"
+            + ("  [save]" if improved else ""))
+        csv_w.writerow([epoch + 1, f"{train_loss:.6f}", f"{v_loss:.6f}",
+                        f"{v_l1:.4f}", f"{dt:.2f}", int(improved)])
+        if improved:
             best_val = v_loss
+            epochs_since_improve = 0
             torch.save({"state_dict": model.state_dict(),
                         "W": ds.W, "H": ds.H,
                         "epoch": epoch + 1, "val_loss": v_loss},
                        out_path)
-            print(f"  [save] {out_path}  (val_loss={v_loss:.5f})")
+        else:
+            epochs_since_improve += 1
+            if args.patience > 0 and epochs_since_improve >= args.patience:
+                stop_reason = (f"early-stop: {args.patience} epochs without "
+                               f"val_loss improvement")
+                log(f"  {stop_reason}")
+                break
 
-    print(f"\nbest val_loss={best_val:.5f} → {out_path}")
+    csv_f.close()
+    log(f"\n{stop_reason}; best val_loss={best_val:.5f} -> {out_path}")
 
 
 if __name__ == "__main__":
