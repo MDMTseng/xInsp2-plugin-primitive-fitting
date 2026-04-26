@@ -375,8 +375,12 @@ RandomScene make_random_scene(int seed, NoiseLevel level, bool dashed_edge,
     const int  spike_bmin      = 3;
     const int  spike_bmax      = harsh ? 12 : 8;
     const int  spike_intensity = std::min(255, bg_lo + delta * 2 + uni_i(20, 60));
+    // Distribute spikes uniformly across the full image height.
+    // (Earlier versions confined spikes to y < y0-10 to avoid occluding
+    // the curve below; the asymmetry made the algorithm task easier
+    // than reality. Uniform distribution is more honest.)
     draw_spikes(img, rng, spike_count, spike_bmin, spike_bmax,
-                5, (int)gt.y0 - 10, spike_intensity);
+                5, H - 5, spike_intensity);
     gt.spike_count = spike_count;
 
     // False horizontal stripes — length up to 30 % of W, placed inside
