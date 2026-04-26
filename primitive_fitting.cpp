@@ -674,7 +674,7 @@ private:
     // CALIPER_H_CNN is the y-axis spatial dim. If the user reconfigures
     // the plugin's `caliper_width` / `caliper_span` away from these
     // values the CNN path will silently rescale the ROI.
-    static constexpr int CALIPER_W_CNN = 3;
+    static constexpr int CALIPER_W_CNN = 15;
     static constexpr int CALIPER_H_CNN = 80;
 
     // Lazy-load the ONNX model. Reloads if the path changed. Caller
@@ -730,9 +730,19 @@ private:
                 }
             }
         }
-        net.setInput(blob);
-        cv::Mat out = net.forward();   // [N, 80] logits
-        if (!out.isContinuous()) out = out.clone();
+        // Guard forward(): a shape-mismatched ONNX would otherwise
+        // throw cv::Exception and abort the inspection. On failure
+        // bail with no hits — caller's used_cnn flag stays true so
+        // the classical extractor is *not* invoked for this image
+        // (an explicit no-op is safer than silent fallback).
+        cv::Mat out;
+        try {
+            net.setInput(blob);
+            out = net.forward();
+            if (!out.isContinuous()) out = out.clone();
+        } catch (const cv::Exception&) {
+            return;
+        }
         float* p_all = out.ptr<float>();
         const int total = N * CALIPER_H_CNN;
         for (int i = 0; i < total; ++i)

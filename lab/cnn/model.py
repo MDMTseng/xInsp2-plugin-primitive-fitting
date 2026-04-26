@@ -35,7 +35,7 @@ class CaliperEdgeNet(nn.Module):
     To restore the original 40 K-param config, pass `hidden=64`.
     """
 
-    def __init__(self, in_ch: int = 3, hidden: int = 32):
+    def __init__(self, in_ch: int = 15, hidden: int = 32):
         super().__init__()
         h1 = hidden // 2  # narrower first stage
         self.net = nn.Sequential(

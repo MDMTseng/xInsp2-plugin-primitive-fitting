@@ -37,7 +37,7 @@ namespace lab {
 
 namespace {
 
-constexpr int CAL_W      = 3;     // matches dump_caliper_dataset.cpp
+constexpr int CAL_W      = 15;    // matches dump_caliper_dataset.cpp
 constexpr int CAL_H      = 80;
 constexpr int N_CAL      = 16;    // calipers per image
 constexpr int TOP_K_NMS  = 3;     // peaks kept per caliper
@@ -212,11 +212,20 @@ std::vector<cv::Point2d> detect_caliper_cnn(const cv::Mat& gray,
     }
 
     // 2-3. Build batch blob and run CNN forward in one shot.
+    // Guard forward() — a shape-mismatched ONNX (e.g. an old
+    // CAL_W=3 model after CAL_W has been bumped to 15) would
+    // otherwise propagate a cv::Exception and abort the bench.
     cv::Mat blob = build_blob(gray, cxs, y0);
     std::lock_guard<std::mutex> lk(g_model_mu);
-    mh.net.setInput(blob);
-    cv::Mat out = mh.net.forward();           // [N_CAL, CAL_H] logits
-    if (!out.isContinuous()) out = out.clone();
+    cv::Mat out;
+    try {
+        mh.net.setInput(blob);
+        out = mh.net.forward();
+        if (!out.isContinuous()) out = out.clone();
+    } catch (const cv::Exception&) {
+        mh.loaded = false;       // disable for the rest of the run
+        return {};
+    }
     sigmoid_inplace(out.ptr<float>(), N_CAL * CAL_H);
 
     // 4. Per-caliper NMS top-K peaks.

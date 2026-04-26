@@ -45,7 +45,13 @@ namespace fs = std::filesystem;
 
 namespace {
 
-constexpr int CAL_W = 3;          // 3-column horizontal stripe
+// Wide-context caliper: 15 columns spanning ±7 px around the caliper
+// centre. Lets the CNN see one full half of any false stripe (stripes
+// span up to 30 % of W = 96 px, so a 15-col window catches at least
+// one stripe edge in roughly half the calipers a stripe traverses)
+// instead of just the 3-pixel column triplet that hides stripe-vs-
+// edge texture. Increases first-layer params 5×; total still ~12 K.
+constexpr int CAL_W = 15;
 constexpr int CAL_H = 80;         // vertical extent
 
 struct Record {
