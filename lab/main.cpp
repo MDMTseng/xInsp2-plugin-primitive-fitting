@@ -106,6 +106,8 @@ int main(int argc, char** argv) {
         {"caliper_cnn",         lab::detect_caliper_cnn},
         {"caliper_cnn_cross",   lab::detect_caliper_cnn_cross},
         {"caliper_cnn_ort",     lab::detect_caliper_cnn_cross_ort},
+        {"caliper_cnn_prosac",  lab::detect_caliper_cnn_cross_ort_prosac},
+        {"caliper_cnn_spline",  lab::detect_caliper_cnn_cross_ort_spline},
     };
     std::vector<Agg> aggs(cases.size());
     for (size_t i = 0; i < cases.size(); ++i) aggs[i].name = cases[i].name;

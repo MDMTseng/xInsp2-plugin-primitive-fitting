@@ -116,5 +116,7 @@ std::vector<cv::Point2d> detect_constrained_knot_dp (const cv::Mat& gray, const 
 std::vector<cv::Point2d> detect_caliper_cnn         (const cv::Mat& gray, const GroundTruth& gt);
 std::vector<cv::Point2d> detect_caliper_cnn_cross   (const cv::Mat& gray, const GroundTruth& gt);
 std::vector<cv::Point2d> detect_caliper_cnn_cross_ort(const cv::Mat& gray, const GroundTruth& gt);
+std::vector<cv::Point2d> detect_caliper_cnn_cross_ort_prosac(const cv::Mat& gray, const GroundTruth& gt);
+std::vector<cv::Point2d> detect_caliper_cnn_cross_ort_spline(const cv::Mat& gray, const GroundTruth& gt);
 
 } // namespace lab
