@@ -59,6 +59,11 @@ def parse_args():
                          "val_loss improvement; 0 disables")
     ap.add_argument("--metrics-csv", type=str, default="",
                     help="per-epoch metrics CSV (default: <out>.metrics.csv)")
+    ap.add_argument("--hidden", type=int, default=0,
+                    help="model hidden width (0 = use class default)")
+    ap.add_argument("--cross-ky", type=int, default=0,
+                    help="cross-caliper Conv2d kernel y-size (cross models only; "
+                         "0 = use class default)")
     return ap.parse_args()
 
 
@@ -97,7 +102,12 @@ def main():
                           num_workers=0)
 
     model_cls = CrossCaliperEdgeNet if is_scene else CaliperEdgeNet
-    model = model_cls().to(args.device)
+    model_kwargs = {}
+    if args.hidden > 0:
+        model_kwargs["hidden"] = args.hidden
+    if is_scene and args.cross_ky > 0:
+        model_kwargs["cross_ky"] = args.cross_ky
+    model = model_cls(**model_kwargs).to(args.device)
     n_params = sum(p.numel() for p in model.parameters())
     log(f"model: {model_cls.__name__}, parameters: {n_params:,}")
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
