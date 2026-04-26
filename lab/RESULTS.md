@@ -66,6 +66,63 @@ Two observations:
    y-direction edges — a property that's harder to encode in a
    hand-crafted filter without also rejecting weak edges.
 
+## v6 — blend-augmented robustness training
+
+V5-lite achieved 0% outlier in normal/harsh/photo, but its training
+distribution never showed cross-scene image composites. The lab's
+new `--blend ALPHA` flag (also exposed in dump_caliper_dataset as
+`--blend-prob P --blend-alpha A`) tests robustness by alpha-mixing
+each scene with another randomly-paired scene's image.
+
+OOD regression of v5-lite under blend(0.2):
+
+  Combo               v5-lite (no blend train)
+                      Outlier  Coverage
+  Normal + blend       14.0%    91%
+  Harsh  + blend        4.0%    95%
+  Photo  + blend       12.0%    91%
+
+The CNN's training distribution didn't include cross-scene composites,
+so the partner scene's curve is treated as a real edge — 12-14% of
+scenes fail outright.
+
+V6 retrains the same architecture on the union of the original 13 K
+scene records plus 13 K blend-augmented records (50/50 mix, alpha
+0.2). 60 epochs, ~30 minutes CPU.
+
+| Combo | v5-lite (no blend train) | **v6 (blend aug)** |
+|---|---:|---:|
+| Normal | 0.0% / 0.166 | 0.0% / 0.176 |
+| Harsh  | 0.0% / 0.175 | **2.0% / 0.181** |
+| Photo  | 0.0% / 0.161 | 0.0% / 0.170 |
+| Normal+blend | 14.0% / 0.183 | **0.0% / 0.175** ⭐ |
+| Harsh+blend  | 4.0% / 0.201  | **7.0% / 0.209** |
+| Photo+blend  | 12.0% / 0.180 | **1.0% / 0.169** ⭐ |
+
+(Format: outlier-scene-rate / RMS p50 px; `caliper_cnn_prosac` row.)
+
+OOD regression on normal+blend and photo+blend almost fully resolved
+(12-14% → 0-1%). Cost: ~3 pp outlier rate in pure-harsh and
+harsh+blend modes — the 19 K-parameter model now has to span 6 sub-
+distributions instead of 3, and capacity is the bottleneck. A larger
+v6-full at ~47 K params would likely recover the harsh regression.
+
+Crucially, **v6 now strictly dominates spline_knot_dp on worst-case
+outlier rate across all six combinations**:
+
+| Combo | spline_knot_dp Outlier | **v6 caliper_cnn_prosac** |
+|---|---:|---:|
+| Normal       | 3.0%  | **0.0%** |
+| Harsh        | 8.0%  | **2.0%** |
+| Photo        | 3.0%  | **0.0%** |
+| Normal+blend | 3.0%  | **0.0%** |
+| Harsh+blend  | 16.0% | **7.0%** |
+| Photo+blend  | 3.0%  | **1.0%** |
+
+Saturating-evidence p90-κ keeps spline_knot_dp competitive on RMS p50
+(0.118-0.217 vs CNN's 0.169-0.209), but the trained CNN family is
+the worst-case-error winner across the OOD-extended benchmark.
+
 ## Final lab summary (CNN family, all variants)
 
 Cross-regime numbers (100 seeds × normal / harsh / photo):
