@@ -97,7 +97,15 @@ int main(int argc, char** argv) {
                            : (level == lab::NoiseLevel::Photo) ? " (photo: + illumination/tint)"
                            :                                     "";
     fs::create_directories(out_dir);
-    fs::create_directories(out_dir / "samples");
+    // Clear stale overlay PNGs from previous runs so the samples
+    // folder always reflects only the current algos / seeds.
+    if (fs::exists(out_dir / "samples")) {
+        for (auto& p : fs::directory_iterator(out_dir / "samples")) {
+            if (p.path().extension() == ".png") fs::remove(p.path());
+        }
+    } else {
+        fs::create_directories(out_dir / "samples");
+    }
 
     struct Case { const char* name; lab::Algo fn; };
     std::vector<Case> cases = {
