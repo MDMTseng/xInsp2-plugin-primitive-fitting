@@ -66,6 +66,8 @@ int main(int argc, char** argv) {
             level = lab::NoiseLevel::Low;
         } else if (!std::strcmp(argv[i], "--no-noise")) {
             level = lab::NoiseLevel::None;
+        } else if (!std::strcmp(argv[i], "--photo")) {
+            level = lab::NoiseLevel::Photo;
         } else if (!std::strcmp(argv[i], "--dashed")) {
             dashed = true;
         } else if (!std::strcmp(argv[i], "--bumpy")) {
@@ -75,6 +77,7 @@ int main(int argc, char** argv) {
     const char* level_name = (level == lab::NoiseLevel::Harsh) ? " (harsh)"
                            : (level == lab::NoiseLevel::Low)   ? " (low-noise, stripes only)"
                            : (level == lab::NoiseLevel::None)  ? " (no pixel noise, stripes only)"
+                           : (level == lab::NoiseLevel::Photo) ? " (photo: + illumination/tint)"
                            :                                     "";
     fs::create_directories(out_dir);
     fs::create_directories(out_dir / "samples");

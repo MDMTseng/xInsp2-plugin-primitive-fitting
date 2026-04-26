@@ -49,7 +49,9 @@ struct RandomScene {
     cv::Mat      image;
     GroundTruth  gt;
 };
-enum class NoiseLevel { None, Low, Normal, Harsh };
+// Photo: same noise distribution as Normal plus a per-scene
+// photometric augmentation pass (gradient + vignette + blob + tint).
+enum class NoiseLevel { None, Low, Normal, Harsh, Photo };
 RandomScene make_random_scene(int seed,
                               NoiseLevel level = NoiseLevel::Normal,
                               bool dashed_edge = false,

@@ -101,6 +101,7 @@ int main(int argc, char** argv) {
         } else if (!std::strcmp(argv[i], "--harsh"))     level = lab::NoiseLevel::Harsh;
         else if  (!std::strcmp(argv[i], "--low-noise")) level = lab::NoiseLevel::Low;
         else if  (!std::strcmp(argv[i], "--no-noise"))  level = lab::NoiseLevel::None;
+        else if  (!std::strcmp(argv[i], "--photo"))     level = lab::NoiseLevel::Photo;
     }
 
     std::vector<Record> records;

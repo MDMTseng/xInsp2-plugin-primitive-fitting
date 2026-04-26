@@ -100,6 +100,71 @@ void apply_dashed_edge(cv::Mat& img, std::mt19937& rng,
     }
 }
 
+// Apply photometric variation in-place. Combines four effects sampled
+// per scene; meant to mimic real-world lighting/shading the bench
+// scene generator otherwise lacks (uniform tint, non-uniform
+// illumination, vignette, smooth gradient).
+//
+//   1. Linear additive gradient — direction θ uniform; magnitude grad_amp.
+//      I(x,y) += grad_amp * (cos θ·u + sin θ·v) / norm,  u,v ∈ [-1,1].
+//   2. Radial vignette — multiplicative darken at corners.
+//      I(x,y) *= 1 - vign * (r / r_max)^2.
+//   3. Gaussian illumination blob — single bright/dark spot with random
+//      centre and σ, sign sampled.
+//      I(x,y) += blob_amp * exp(-((x-bx)^2+(y-by)^2) / (2 bs^2)).
+//   4. Low-frequency multiplicative gain (grayscale 'tint' analog).
+//      I(x,y) *= 1 + gain * (cos φ·u + sin φ·v).
+//
+// 'strength' = 1.0 → moderate; 2.0 → photo-mode aggressive.
+void apply_photometric(cv::Mat& img, std::mt19937& rng, double strength) {
+    if (strength <= 0.0) return;
+    const int W = img.cols, H = img.rows;
+    std::uniform_real_distribution<double> uni(0.0, 1.0);
+    std::uniform_real_distribution<double> ang(0.0, 2.0 * kPi);
+    std::uniform_real_distribution<double> sgn(-1.0, 1.0);
+
+    const double grad_amp = uni(rng) * 30.0 * strength;
+    const double grad_th  = ang(rng);
+    const double vign     = uni(rng) * 0.20 * strength;
+    const double blob_amp = sgn(rng) * 40.0 * strength;
+    const double bx       = uni(rng) * (double)W;
+    const double by       = uni(rng) * (double)H;
+    const double bs       = (0.20 + 0.30 * uni(rng)) * (double)W;
+    const double bs2      = 2.0 * bs * bs;
+    const double gain_amp = uni(rng) * 0.20 * strength;
+    const double gain_th  = ang(rng);
+
+    const double cx = W * 0.5, cy = H * 0.5;
+    const double r_max2 = cx * cx + cy * cy;
+    const double gvx = std::cos(grad_th), gvy = std::sin(grad_th);
+    const double tvx = std::cos(gain_th), tvy = std::sin(gain_th);
+
+    for (int y = 0; y < H; ++y) {
+        uint8_t* row = img.ptr<uint8_t>(y);
+        const double v_y = (y - cy) / cy;     // [-1, 1]
+        for (int x = 0; x < W; ++x) {
+            const double u_x = (x - cx) / cx; // [-1, 1]
+            double v = (double)row[x];
+            // 1. Linear gradient (additive).
+            v += grad_amp * (gvx * u_x + gvy * v_y);
+            // 2. Vignette (multiplicative).
+            const double dx = x - cx, dy = y - cy;
+            const double r2 = (dx * dx + dy * dy) / r_max2;
+            v *= 1.0 - vign * r2;
+            // 3. Gaussian blob (additive).
+            const double bdx = x - bx, bdy = y - by;
+            const double br2 = (bdx * bdx + bdy * bdy) / bs2;
+            v += blob_amp * std::exp(-br2);
+            // 4. Low-frequency multiplicative gain.
+            v *= 1.0 + gain_amp * (tvx * u_x + tvy * v_y);
+
+            if (v < 0)   v = 0;
+            if (v > 255) v = 255;
+            row[x] = (uint8_t)v;
+        }
+    }
+}
+
 // Apply Gaussian + salt&pepper noise in-place.
 void add_noise(cv::Mat& img, std::mt19937& rng,
                double gaussian_sigma, double salt_pepper_fraction) {
@@ -164,6 +229,7 @@ RandomScene make_random_scene(int seed, NoiseLevel level, bool dashed_edge,
     const bool harsh = (level == NoiseLevel::Harsh);
     const bool low   = (level == NoiseLevel::Low);
     const bool none  = (level == NoiseLevel::None);
+    const bool photo = (level == NoiseLevel::Photo);
     std::mt19937 rng((uint32_t)seed);
     auto uni_d = [&](double lo, double hi) {
         return std::uniform_real_distribution<double>(lo, hi)(rng);
@@ -326,15 +392,25 @@ RandomScene make_random_scene(int seed, NoiseLevel level, bool dashed_edge,
     draw_stripes(img, rng, stripe_count, stripe_max_frac,
                  stripe_y_lo, stripe_y_hi, stripe_intensity);
 
+    // Photometric augmentation (lighting/shading/tint). Photo mode
+    // applies it at full strength; harsh adds a milder pass. Other
+    // levels skip — keeps the existing benchmark numbers reproducible.
+    const double photo_strength = photo ? uni_d(0.6, 1.5)
+                                : harsh ? uni_d(0.0, 0.5)
+                                :         0.0;
+    if (photo_strength > 0.0) apply_photometric(img, rng, photo_strength);
+
     // Noise — Gaussian σ and salt-pepper fraction sampled independently.
     // Harsh mode raises both ceilings; low mode nearly eliminates them.
     const double gsigma = harsh ? uni_d(0.0, 12.0)
                          : low   ? uni_d(0.0, 1.5)
                          : none  ? 0.0
+                         : photo ? uni_d(0.0, 6.0)
                          :         uni_d(0.0, 6.0);
     const double sp     = harsh ? uni_d(0.0, 0.04)
                          : low   ? uni_d(0.0, 0.002)
                          : none  ? 0.0
+                         : photo ? uni_d(0.0, 0.012)
                          :         uni_d(0.0, 0.012);
     add_noise(img, rng, gsigma, sp);
     gt.gaussian_sigma = gsigma;
