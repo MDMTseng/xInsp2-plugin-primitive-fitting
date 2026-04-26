@@ -113,7 +113,7 @@ def main():
                         "W": ds.W, "H": ds.H,
                         "epoch": epoch + 1, "val_loss": v_loss},
                        out_path)
-            print(f"  ✓ saved {out_path}  (val_loss={v_loss:.5f})")
+            print(f"  [save] {out_path}  (val_loss={v_loss:.5f})")
 
     print(f"\nbest val_loss={best_val:.5f} → {out_path}")
 
