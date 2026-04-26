@@ -567,8 +567,88 @@ primitive_fitting/
 ├── primitive_fitting.dll          ← build output (placed beside plugin.json)
 ├── primitive_fitting_test.exe     ← native test runner
 ├── cert.json              ← written by host (or your test) on baseline pass
+├── lab/                   ← algorithm research (see lab/RESULTS.md)
+│   └── cnn/               ← CNN training pipeline
 └── build/                 ← cmake out-of-tree dir
 ```
+
+---
+
+## CNN edge-filter mode (optional)
+
+The plugin's hand-crafted gradient + NMS peak extractor can be
+replaced by a learned 1-D / 2-D CNN with two config flags. Either
+the per-caliper [N, 15, 80] CaliperEdgeNet or the cross-caliper
+[1, N, 15, 80] CrossCaliperEdgeNet works — input rank is auto-
+detected when the ONNX file is loaded.
+
+Enable via UI checkbox or JSON config:
+```json
+{ "use_cnn_peak_filter": true,
+  "cnn_onnx_path":       "C:/path/to/caliper_edge_v5lite.onnx" }
+```
+
+Constraints (must match training):
+* `caliper_width` is effectively forced to 3 for v3 models, 15 for v4/v5
+* `caliper_span`  is effectively forced to 80
+* The model file is loaded once and cached; reload triggers on path change.
+
+Failure handling: if the ONNX is missing, mismatched-shape, or the
+forward call throws, the plugin returns no hits for the image (rather
+than silently swapping in the classical extractor). This makes
+quality regressions obvious instead of disguised.
+
+### Training pipeline
+
+The full CNN training pipeline lives in `lab/cnn/`:
+
+```sh
+# 1. Generate dataset (5000 scenes × 16 calipers, scene-grouped):
+./lab/build/Release/dump_caliper_dataset.exe \
+    lab/cnn/data/normal_sc.bin --scenes 5000 --scene-records
+./lab/build/Release/dump_caliper_dataset.exe \
+    lab/cnn/data/harsh_sc.bin  --scenes 3000 --harsh --scene-records
+./lab/build/Release/dump_caliper_dataset.exe \
+    lab/cnn/data/photo_sc.bin  --scenes 5000 --photo --scene-records
+
+# 2. Train CrossCaliperEdgeNet (≈10 min on CPU):
+cd lab/cnn
+python -m venv .venv
+.venv/Scripts/pip install "torch==2.5.1" \
+    --index-url https://download.pytorch.org/whl/cpu
+.venv/Scripts/pip install numpy onnx matplotlib
+.venv/Scripts/python.exe train.py \
+    data/normal_sc.bin data/harsh_sc.bin data/photo_sc.bin \
+    --epochs 60 --bs 32 --patience 10 --out caliper_edge_v5.pt
+
+# Optional: monitor every 5 min
+.venv/Scripts/python.exe plot_metrics.py caliper_edge_v5.pt.metrics.csv
+
+# 3. Export to ONNX:
+.venv/Scripts/python.exe export_onnx.py \
+    caliper_edge_v5.pt --out caliper_edge_v5.onnx --K 16
+
+# 4. Point the plugin at it:
+#    UI → set "ONNX path" to lab/cnn/caliper_edge_v5.onnx and tick the box.
+```
+
+Lab-bench (100 random scenes per regime, see `lab/RESULTS.md` for
+the full breakdown):
+
+| Algorithm                   | Outlier (n / h / p) | RMS p50 (n / h / p) | ms |
+|-----------------------------|--------------------:|--------------------:|---:|
+| `caliper_cnn_prosac`        | 0% / 0% / 0%        | 0.17 / 0.18 / 0.16  | 0.65 |
+| `caliper_cnn_ort` (v5-lite) | 0% / 0% / 0%        | 0.20 / 0.23 / 0.19  | 0.78 |
+| `caliper_ransac` (default)  | 4% / 74% / 7%       | 0.20 / 0.04* / 0.22 | 0.43 |
+
+*caliper_ransac p50 ≈ 0 in harsh is a fail-statistic artefact.
+
+In practice: a model trained with `lab/cnn/train.py` plus
+`fit_model = "polynomial"` in plugin config gives the same DP+poly
++ safety-net behaviour as the lab's `caliper_cnn_prosac` — the CNN
+emits clean per-caliper hits, the plugin's adaptive-degree poly
+RANSAC fits a smooth curve through them, IRLS refines, the
+confidence pipeline reports stability/coverage, etc.
 
 Project-scoped per-instance data lives elsewhere — under
 `<project>/instances/<instance_name>/` — accessible via

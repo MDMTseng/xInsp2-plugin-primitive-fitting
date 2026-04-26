@@ -66,6 +66,121 @@ Two observations:
    y-direction edges — a property that's harder to encode in a
    hand-crafted filter without also rejecting weak edges.
 
+## Final lab summary (CNN family, all variants)
+
+Cross-regime numbers (100 seeds × normal / harsh / photo):
+
+| Algorithm | RMS p50 (n / h / p) | RMS p90 | Coverage | Outlier | ms p50 |
+|---|---:|---:|---:|---:|---:|
+| `caliper_cnn_prosac` ⭐ | **0.166 / 0.175 / 0.161** | 0.36 / 0.46 / 0.37 | ≥99.3% | **0.0%** | **0.65** |
+| `caliper_cnn_ort` (v5-lite) | 0.195 / 0.227 / 0.193 | 0.31 / 0.45 / 0.31 | ≥99.2% | 0.0% | 0.78 |
+| `caliper_cnn_spline` | 0.239 / 0.273 / 0.238 | 0.32 / 0.45 / 0.32 | ≥98.9% | 0.0% | 0.64 |
+| `caliper_cnn_cross` (cv::dnn) | 0.195 / 0.227 / 0.193 | 0.31 / 0.45 / 0.31 | ≥99.2% | 0.0% | 1.97 |
+| `spline_knot_dp` (ref) | 0.118 / 0.163 / 0.124 | 0.26 / 0.44 / 0.27 | ≥93.2% | 1.7-8.3% | 4.5-5.3 |
+
+The CNN family of algorithms — `caliper_cnn_prosac` in particular —
+occupies a previously empty spot on the lab's quality/speed Pareto
+frontier: **sub-millisecond, sub-pixel, zero-outlier in all noise
+regimes including harsh**. spline_knot_dp still has a tighter median
+RMS (0.118 vs 0.166) but trips on 8% of harsh scenes vs caliper_cnn's
+0%.
+
+Recipe stack (reproducible from this repo):
+
+  1. `dump_caliper_dataset --scene-records` → 16-caliper batches
+  2. `train.py` (60 epochs CPU, ~10 min) → CrossCaliperEdgeNet
+  3. `export_onnx.py` → ONNX (auto-detects in_ch from checkpoint)
+  4. ONNX Runtime backend (XINSP_ENABLE_ORT) → 0.7 ms/scene
+  5. CNN+DP+adaptive-poly with safety net → caliper_cnn_prosac
+
+## CNN + polynomial post-fit (`caliper_cnn_prosac`)
+
+After v5-lite proved cross-caliper inference reliable (0% outlier
+in all regimes), the next question was whether to keep emitting
+piecewise-linear output between the 16 DP picks or fit a smooth
+parametric curve through them. The lab tested three post-fit
+strategies on the same CNN+DP front-end:
+
+| Post-fit | RMS p50 (avg 3 regimes) | RMS p90 (avg) | Outlier | ms |
+|---|---:|---:|---:|---:|
+| Linear interp (cnn_ort)            | 0.205 | 0.36 | 0% | 0.78 |
+| Adaptive poly LSQ + safety net     | **0.167** | 0.40 | **0%** | 0.65 |
+| Natural cubic spline + safety net  | 0.250 | 0.36 | 0% | 0.64 |
+
+Polynomial post-fit wins on RMS p50 by 19% over plain linear interp,
+and beats the natural cubic spline on the median by an even larger
+margin. **The spline is counter-intuitively worse on p50** because
+natural-cubic interpolation through 16 noisy DP picks (CNN sub-pixel
+σ ≈ 0.1 px) overshoots between knots — a smoothing spline (P-spline
+with λ regulariser) would do better but adds complexity.
+
+### Safety net design
+
+Without a guard, polynomial deg-3 LSQ overshoots in ~5% of scenes
+(boundary cubic blow-up despite C¹ linear extrapolation outside the
+inlier x-span). The safeguard runs after fit:
+
+```cpp
+constexpr double DEV_THR_PX = 3.0;
+bool safe = true;
+for (int x = ceil(x_min_in); x <= floor(x_max_in); x += 4) {
+    double dev = std::abs(poly_eval(x) - linear_interp(x));
+    if (dev > DEV_THR_PX) { safe = false; break; }
+}
+if (!safe) return linear_interp_output;
+return poly_output;
+```
+
+I.e. compare polynomial output to a linear-interp baseline through
+the DP picks; if they disagree by more than 3 px anywhere, the
+polynomial is rejected. Catches every overshoot scene (5% → 0%
+outlier in all three regimes).
+
+### Why PROSAC didn't help here (negative result)
+
+Initial attempt: PROSAC sampling over the 48 raw NMS hits
+(16 × top-3 per caliper). Idea: pick polynomial fit from highest-
+probability minimal samples, score by Σ_inlier prob × coverage.
+
+Outcome: 17% outlier scenes — far worse than DP+linear's 0%. PROSAC
+fundamentally cannot reject false-stripe co-occurrences as well as
+sparse DP because it operates on points, not on per-caliper smoothness.
+With ~80% of harsh-mode calipers seeing a stripe peak, PROSAC's
+minimal samples sometimes draw 4 stripe peaks that *all* pass the
+score function (high CNN prob, decent caliper coverage), but produce
+a polynomial that traces the stripe band rather than the curve.
+
+Switching to "DP first, then poly LSQ over the 16 DP picks" fixed
+this — DP enforces per-caliper smoothness which PROSAC structurally
+lacks. The "caliper_cnn_prosac" name is now a misnomer (no random
+sampling phase), kept for benchmark continuity.
+
+## ONNX Runtime backend (`caliper_cnn_ort`)
+
+The same CrossCaliperEdgeNet ONNX runs through three inference
+backends in this lab:
+
+| Backend | ms p50 (avg 3 regimes) | Notes |
+|---|---:|---|
+| Python PyTorch (CPU) | ~1.8 | Reference; not in lab |
+| `cv::dnn` (OpenCV built-in) | 1.97 | `caliper_cnn_cross` |
+| **ONNX Runtime** | **0.78** | `caliper_cnn_ort` ⭐ |
+
+ONNX Runtime is **2.5× faster than cv::dnn** on the same model.
+The lab's CMakeLists auto-detects ORT in the user's NuGet cache
+(or via `ORT_ROOT`); when found, defines `XINSP_ENABLE_ORT` and
+post-build copies `onnxruntime.dll` next to the lab executable.
+Without ORT the algo cleanly stubs out (returns empty / 100% no-hit
+in the benchmark table).
+
+Implementation gotchas captured in commit history:
+- `Ort::Env` cannot be statically initialised on Windows — DLL
+  loader race causes a segfault before main(). Lazy-construct via
+  `std::unique_ptr` inside the first `get_ort()` call.
+- `ORTCHAR_T = wchar_t` on Windows; ONNX path needs widening.
+- Single-thread (`SetIntraOpNumThreads(1)`) is fastest at our
+  47-K-param model size; thread-pool overhead would dominate.
+
 ## Trained-CNN v5 — cross-caliper feature exchange
 
 The biggest single quality jump in any lab algorithm to date.

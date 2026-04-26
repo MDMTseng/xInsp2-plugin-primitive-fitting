@@ -543,7 +543,8 @@ private:
         bool used_cnn = false;
         if (cfg.use_cnn_peak_filter) {
             if (ensure_cnn_loaded_locked()) {
-                find_edges_cnn(gray, scan, cfg, cnn_net_, r.hits);
+                find_edges_cnn(gray, scan, cfg, cnn_net_, cnn_input_rank_,
+                               r.hits);
                 used_cnn = true;
             }
         }
@@ -690,6 +691,23 @@ private:
             cnn_net_ = cv::dnn::readNetFromONNX(cfg_.cnn_onnx_path);
             cnn_loaded_path_ = cfg_.cnn_onnx_path;
             cnn_loaded_ = !cnn_net_.empty();
+            // Auto-detect input rank: try a 4-D forward first; if the
+            // model accepts it, it's a cross-caliper architecture.
+            // Otherwise fall back to 3-D (per-caliper).  Done by probing
+            // with a dummy blob of N=2 calipers (the model never sees
+            // batch=1 alone here, so 2 reveals the K-axis behavior).
+            cnn_input_rank_ = 3;
+            if (cnn_loaded_) {
+                int dims4[4] = {1, 2, CALIPER_W_CNN, CALIPER_H_CNN};
+                cv::Mat probe(4, dims4, CV_32F, cv::Scalar(0.0));
+                try {
+                    cnn_net_.setInput(probe);
+                    cv::Mat out = cnn_net_.forward();
+                    cnn_input_rank_ = 4;       // 4-D succeeded
+                } catch (const cv::Exception&) {
+                    cnn_input_rank_ = 3;       // fall back to 3-D
+                }
+            }
         } catch (const cv::Exception&) {
             cnn_loaded_ = false;
         }
@@ -699,20 +717,18 @@ private:
     // Replace the per-caliper peak extractor with a 1-D CNN forward
     // pass. Builds [N, 3, 80] blob across all calipers, runs cv::dnn,
     // sigmoid + per-caliper NMS top-N, sub-pixel parabolic refine.
-    static void find_edges_cnn(const cv::Mat& gray,
-                               const std::vector<CaliperSample>& scan,
-                               const Config& cfg,
-                               cv::dnn::Net& net,
-                               std::vector<CaliperHit>& out_hits) {
+    // Sample a [N, CALIPER_W_CNN, CALIPER_H_CNN] block of caliper ROIs
+    // into raw float storage (channels-first, [N][C][H]). Helper used
+    // by both the 3-D and 4-D blob paths.
+    static void fill_caliper_rois(const cv::Mat& gray,
+                                  const std::vector<CaliperSample>& scan,
+                                  float* dst_base) {
         const int N = (int)scan.size();
-        if (N == 0) return;
-        int dims[3] = {N, CALIPER_W_CNN, CALIPER_H_CNN};
-        cv::Mat blob(3, dims, CV_32F);
         for (int b = 0; b < N; ++b) {
             const auto& s = scan[b];
             const cv::Point2d ey(s.normal);
             const cv::Point2d ex(-ey.y, ey.x);
-            float* dst_b = blob.ptr<float>(b);
+            float* dst_b = dst_base + (size_t)b * CALIPER_W_CNN * CALIPER_H_CNN;
             for (int c = 0; c < CALIPER_W_CNN; ++c) {
                 float* dst_ch = dst_b + (size_t)c * CALIPER_H_CNN;
                 double off_x = (double)(c - CALIPER_W_CNN / 2);
@@ -729,6 +745,29 @@ private:
                     dst_ch[t] = val;
                 }
             }
+        }
+    }
+
+    static void find_edges_cnn(const cv::Mat& gray,
+                               const std::vector<CaliperSample>& scan,
+                               const Config& cfg,
+                               cv::dnn::Net& net,
+                               int input_rank,           // 3 or 4 (auto-detect)
+                               std::vector<CaliperHit>& out_hits) {
+        const int N = (int)scan.size();
+        if (N == 0) return;
+
+        cv::Mat blob;
+        if (input_rank == 4) {
+            // Cross-caliper model expects [B, N, W, H] with B=1.
+            int dims4[4] = {1, N, CALIPER_W_CNN, CALIPER_H_CNN};
+            blob = cv::Mat(4, dims4, CV_32F);
+            fill_caliper_rois(gray, scan, blob.ptr<float>());
+        } else {
+            // Per-caliper model expects [N, W, H] (each caliper is a batch).
+            int dims3[3] = {N, CALIPER_W_CNN, CALIPER_H_CNN};
+            blob = cv::Mat(3, dims3, CV_32F);
+            fill_caliper_rois(gray, scan, blob.ptr<float>());
         }
         // Guard forward(): a shape-mismatched ONNX would otherwise
         // throw cv::Exception and abort the inspection. On failure
@@ -1962,10 +2001,13 @@ private:
 
     // CNN peak filter — lazy-loaded the first time `use_cnn_peak_filter`
     // is true and `cnn_onnx_path` is non-empty. Reloaded transparently if
-    // the user changes the path.
+    // the user changes the path.  `cnn_input_rank_` is auto-detected at
+    // load time: 3 = per-caliper [N, C, H] (CaliperEdgeNet), 4 =
+    // cross-caliper [B, N, C, H] (CrossCaliperEdgeNet).
     mutable cv::dnn::Net cnn_net_;
     mutable std::string  cnn_loaded_path_;
     mutable bool         cnn_loaded_ = false;
+    mutable int          cnn_input_rank_ = 3;
 };
 
 XI_PLUGIN_IMPL(PrimitiveFitting)
