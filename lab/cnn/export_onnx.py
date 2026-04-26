@@ -46,7 +46,11 @@ def main():
 
     out_path = Path(args.out)
     if is_cross:
-        model = CrossCaliperEdgeNet(in_ch=W)
+        # Detect hidden width from head.weight = [1, hidden, 1] and
+        # cross_ky from cross.0.weight = [hidden, hidden, 3, ky].
+        hidden = int(state["head.weight"].shape[1])
+        cross_ky = int(state["cross.0.weight"].shape[3])
+        model = CrossCaliperEdgeNet(in_ch=W, hidden=hidden, cross_ky=cross_ky)
         model.load_state_dict(state)
         model.eval()
         K = args.K

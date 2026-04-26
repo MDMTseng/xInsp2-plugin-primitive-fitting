@@ -107,6 +107,40 @@ harsh+blend modes — the 19 K-parameter model now has to span 6 sub-
 distributions instead of 3, and capacity is the bottleneck. A larger
 v6-full at ~47 K params would likely recover the harsh regression.
 
+### v6-full (47 K + blend) — capacity does *not* fix the harsh-blend regression
+
+Tested whether the v5-full architecture (hidden=32, cross_ky=7,
+46.9 K params) trained on the same 26 K-record union would recover
+v6's harsh and harsh+blend regression points. Result was *negative*:
+
+| `caliper_cnn_prosac` | v6 (19 K) | v6-full (47 K) |
+|---|---:|---:|
+| Normal       | 0% / 0.176 | 0% / 0.173 |
+| Harsh        | 2% / 0.181 | 2% / 0.176 |
+| Photo        | 0% / 0.170 | 0% / 0.167 |
+| Normal+blend | 0% / 0.175 | 0% / 0.172 |
+| Harsh+blend  | **7% / 0.209** | **10% / 0.188** ← regressed |
+| Photo+blend  | 1% / 0.169 | 0% / 0.162 |
+| ms p50 (avg) | 0.65 | 1.5 (2.5× slower) |
+
+(Format: outlier-scene-rate / RMS p50 px.)
+
+47 K reduces RMS p50 by ~3-7% across the board (more capacity =
+slightly tighter sub-pixel fit), but the worst-case outlier rate
+*does not improve* and harsh+blend gets *worse* (7% → 10%). The
+runtime cost is 2.5× — for no benefit.
+
+Plausible explanation: 6 sub-distributions × 26 K records ≈ 4.3 K
+samples per sub-distribution. At fixed 60-epoch / cosine-LR
+budget the 47 K-param model overfits its per-sub-distribution
+neighbourhood instead of learning the cross-distribution structure,
+while 19 K is at the sweet-spot capacity for this dataset size.
+
+**Recommendation: v6 (19 K) is the production-leaning model.** To
+push harsh+blend below 7% the right next moves are weighted-loss
+oversampling of harsh+blend or a larger blend-augmented dataset
+(say 50 K records), not naively scaling up the model.
+
 Crucially, **v6 now strictly dominates spline_knot_dp on worst-case
 outlier rate across all six combinations**:
 
